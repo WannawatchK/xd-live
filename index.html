@@ -30,6 +30,8 @@ h1{font-size:19px;margin:0}
 .auto select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:4px 8px;margin-left:4px}
 .auto select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .ranges button:disabled{opacity:.45;cursor:default}
+.tag{font:inherit;font-size:13px;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:5px 11px;width:15.5em;max-width:60vw}
+.tag:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .since{font-size:12.5px;color:var(--muted);align-self:center;font-variant-numeric:tabular-nums}
 .since b{color:var(--ink)}
 .live{font:600 12.5px var(--f);padding:3px 10px;border-radius:999px;background:var(--line);color:var(--muted)}
@@ -63,6 +65,10 @@ h1{font-size:19px;margin:0}
     </select></label>
     <span class="since" id="since" aria-live="polite"></span>
   </div>
+  <div class="ranges" id="savegrp" role="group" aria-label="Save data">
+    <input id="tag" class="tag" type="text" autocomplete="off" spellcheck="false" placeholder="file name, e.g. step5_f5_v0.1" aria-label="File name">
+    <button type="button" id="saveBtn" title="Save the samples shown (Start→Stop window, or the time range) as CSV">Save CSV</button>
+  </div>
   <span class="live" id="live" aria-live="polite">connecting…</span>
 </header>
 <div class="status" id="status">starting…</div>
@@ -72,6 +78,7 @@ h1{font-size:19px;margin:0}
   Signal: "±2 g" shows the acceleration itself in g (Z sits near +1 g because of gravity); "Zoom (mg)" applies a zero-phase 0.2 Hz high-pass (removes gravity, drift and slow tilt) and zooms in to see small vibrations. Long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
   Spectrum: Welch average over the whole range (65 s pieces = 0.015 Hz resolution, linear detrend, Hann window, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz; "Spectrum linear" shows peaks the way single-FFT plots do (tall peaks, floor flattened near zero); "Spectrum log" keeps weak modes and the noise floor visible; dotted line = 15 Hz, top of the mode search band (the chip's own filter cuts off near 15.6 Hz). Labels = up to 5 peaks in 0.3–15 Hz at least 3× above the local floor, refined between bins. A peak is a candidate mode: check it shows on every node and stays put across recordings.
   Start / Stop: Start analyses only data from that moment (older data stays stored, just ignored); Stop freezes the window so you can read the result; Auto-stop stops by itself after the chosen time; All data goes back to the normal time range. While a window is set, the range buttons are ignored. The first 65 s use 16 s spectrum pieces (0.06 Hz), then 65 s pieces (0.015 Hz). The window is kept per node across reloads.
+  Save CSV: saves exactly the samples in view (the Start→Stop window, or the selected time range) in the same layout as the step 3/5 lab files (raw LSB x,y,z with #T timing lines), so step3_noise.py and step5_shaker.py read it unchanged. Type a name such as step5_f5_v0.1 so step5_shaker.py knows the frequency and Vpp; empty = node + time.
   LIVE: while this page is open it asks the node to also send its newest samples every 0.25 s (about 0.5–1 s behind); the 10-second blocks fill in the history.
   Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
 </div>
@@ -484,6 +491,48 @@ stopBtn.addEventListener("click", ()=>{ if(recRunning()){ rec.stop = Date.now()*
 allBtn.addEventListener("click", ()=>{ rec.start = null; rec.stop = null; recChanged(); });
 autoSel.addEventListener("change", ()=>{ rec.auto = +autoSel.value; recChanged(); });   // also applies to a recording already running
 paintRec();
+
+// ---------- Save CSV: the samples in view, in the same layout as the step 3/5 lab files ----------
+// raw LSB "x,y,z" lines + "#T,<sample index>,<µs since first sample>,NA" every 625 samples,
+// so step3_noise.py / step5_shaker.py read it unchanged (name it ..._f5_v0.1 for step 5).
+// Calibration is undone (raw = g × CAL × 256000) because those scripts apply CAL_SCALE themselves.
+function saveCsv(){
+  const d = gather(RANGES[rangeI][1]);
+  if(!d || d.t.length < 2){ setStatus("nothing to save yet: no samples in this window"); return; }
+  const {t, g} = d, n = t.length, LSB = 256000;
+  let dsum=0, dn=0; for(let i=1;i<n;i++){ const x=t[i]-t[i-1]; if(x>0 && x<48000){ dsum+=x; dn++; } }
+  const fs = dn ? 1e6/(dsum/dn) : 62.5;
+  const iso = us => new Date(us/1000).toISOString();
+  const out = [
+    "#RECORDED_AT," + fmtTime(t[0]),
+    "#SOURCE,Project XD Live web page," + NODE,
+    "#START",
+    "#FIRMWARE,xd_step6_cloud,v3",
+    "#SETTINGS,ODR_HZ=62.5,LPF_HZ=15.625,RANGE_G=2,LSB_PER_G=" + LSB,
+    "#WINDOW_UTC," + iso(t[0]) + "," + iso(t[n-1]),
+    "#WINDOW_TH," + fmtTime(t[0]) + "," + fmtTime(t[n-1]),
+    "#UTC0_US," + Math.round(t[0]),
+    "#FS_MEASURED," + fs.toFixed(4),
+    "#CAL_SCALE_UNDONE," + CAL.join(","),
+    "#FORMAT,x,y,z (raw LSB)"
+  ];
+  let gaps = 0;
+  for(let i=0;i<n;i++){
+    if(i && t[i]-t[i-1] > 3e6/fs){ gaps++; out.push("#GAP," + i + "," + ((t[i]-t[i-1])/1000).toFixed(1) + "_ms"); }
+    if(i % 625 === 0) out.push("#T," + i + "," + (Math.round(t[i]-t[0]) % 4294967296) + ",NA");
+    out.push(Math.round(g[3*i]*CAL[0]*LSB) + "," + Math.round(g[3*i+1]*CAL[1]*LSB) + "," + Math.round(g[3*i+2]*CAL[2]*LSB));
+  }
+  if((n-1) % 625) out.push("#T," + (n-1) + "," + (Math.round(t[n-1]-t[0]) % 4294967296) + ",NA");   // last tick, so fs uses the whole file
+  const tag = document.getElementById("tag").value.trim().replace(/\.csv$/i, "").replace(/[^A-Za-z0-9_.-]+/g, "_");
+  const stamp = fmtTime(t[0]).replace(/[-:]/g, "").replace(" ", "_") + "-" + fmtTime(t[n-1]).slice(11).replace(/:/g, "");
+  const name = NODE.replace(/\//g, "_") + "_" + (tag || stamp) + ".csv";
+  const url = URL.createObjectURL(new Blob([out.join("\n") + "\n"], {type:"text/csv"}));
+  const a = document.createElement("a"); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 10000);
+  const sec = Math.round((t[n-1]-t[0])/1e6);
+  setStatus(`saved ${name} · ${n.toLocaleString()} samples · ${Math.floor(sec/60)}:${String(sec%60).padStart(2,"0")} · ${gaps} gap${gaps===1?"":"s"}` + (gaps ? " (marked #GAP in the file; step5_shaker.py assumes no gaps, so its frequency and amplitude will be off: pick a window without gaps)" : ""));
+}
+document.getElementById("saveBtn").addEventListener("click", saveCsv);
 refresh(); setInterval(refresh, 10000);
 </script>
 </body>
