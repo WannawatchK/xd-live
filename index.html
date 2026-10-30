@@ -47,6 +47,9 @@ h1{font-size:19px;margin:0}
   <div class="ranges" id="scale" role="group" aria-label="Signal scale">
     <button type="button" data-s="fixed">±2 g</button><button type="button" data-s="auto">Zoom (mg)</button>
   </div>
+  <div class="ranges" id="spec" role="group" aria-label="Spectrum scale">
+    <button type="button" data-p="log">Spectrum log</button><button type="button" data-p="linear">Spectrum linear</button>
+  </div>
   <span class="live" id="live" aria-live="polite">connecting…</span>
 </header>
 <div class="status" id="status">starting…</div>
@@ -54,7 +57,7 @@ h1{font-size:19px;margin:0}
 <div class="grid" id="grid"></div>
 <div class="foot">
   Signal: "±2 g" shows the acceleration itself in g (Z sits near +1 g because of gravity); "Zoom (mg)" applies a zero-phase 0.2 Hz high-pass (removes gravity, drift and slow tilt) and zooms in to see small vibrations. Long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
-  Spectrum: Welch average over the whole range (65 s pieces = 0.015 Hz resolution, linear detrend, Hann window, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz; dotted line = 15 Hz, top of the mode search band (the chip's own filter cuts off near 15.6 Hz). Labels = up to 5 peaks in 0.3–15 Hz at least 3× above the local floor, refined between bins. A peak is a candidate mode: check it shows on every node and stays put across recordings.
+  Spectrum: Welch average over the whole range (65 s pieces = 0.015 Hz resolution, linear detrend, Hann window, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz; "Spectrum linear" shows peaks the way single-FFT plots do (tall peaks, floor flattened near zero); "Spectrum log" keeps weak modes and the noise floor visible; dotted line = 15 Hz, top of the mode search band (the chip's own filter cuts off near 15.6 Hz). Labels = up to 5 peaks in 0.3–15 Hz at least 3× above the local floor, refined between bins. A peak is a candidate mode: check it shows on every node and stays put across recordings.
   LIVE: while this page is open it asks the node to also send its newest samples every 0.25 s (about 0.5–1 s behind); the 10-second blocks fill in the history.
   Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
 </div>
@@ -66,12 +69,13 @@ const BUCKET = "xd-raw";
 const NODE = new URLSearchParams(location.search).get("node") || "S01";
 const CAL = [0.98903, 0.99305, 1.01354];
 const H = {Authorization: "Bearer " + KEY, apikey: KEY};
-const RANGES = [["10 min",600],["1 hour",3600],["4 hours",14400],["6 hours",21600],["12 hours",43200],["1 day",86400]];
+const RANGES = [["10 min",600],["30 min",1800],["1 hour",3600],["4 hours",14400],["6 hours",21600],["12 hours",43200],["1 day",86400]];
 const NSEG = 4096;                       // Welch piece, about 65 s at 62.7 Hz
 document.getElementById("node").textContent = NODE;
 
+let specMode = (()=>{ try { return localStorage.getItem("xd-spec") || "log"; } catch(e){ return "log"; } })();   // spectrum y-axis: log (noise floor, weak modes) or linear (peaks stand out)
 let scaleMode = (()=>{ try { return localStorage.getItem("xd-scale") || "fixed"; } catch(e){ return "fixed"; } })();
-let rangeI = (()=>{ try { return +localStorage.getItem("xd-range") || 0; } catch(e){ return 0; } })();
+let rangeI = (()=>{ try { const i = RANGES.findIndex(r=>r[1]===+localStorage.getItem("xd-range-s")); return i<0 ? 0 : i; } catch(e){ return 0; } })();   // saved by seconds, so adding buttons never shifts it
 const blocks = new Map();                // key -> {utc: Float64Array (µs), g: Float32Array(n*3)}
 let approx = false, busy = false;
 const live = {t:[], g:[], last:0};      // live samples (µs, [x,y,z] g) newer than the stored blocks
@@ -363,7 +367,7 @@ function draw(){
     const ya = fixed ? {gridcolor:LINE,zeroline:true,zerolinecolor:LINE,range:[-2.2,2.2],tickvals:[-2,-1,0,1,2],fixedrange:true} : {gridcolor:LINE,zeroline:false};
     Plotly.react("pt"+k, traces, Object.assign({}, base, {xaxis:{gridcolor:LINE,range:xr,type:"date"}, yaxis:ya}), cfg);
   }
-  const every = {600:2,3600:5,14400:15,21600:20,43200:30,86400:60}[W];
+  const every = {600:2,1800:3,3600:5,14400:15,21600:20,43200:30,86400:60}[W];
   const key = rangeI+":"+Math.floor(t1/(every*1e6))+":"+Math.round(n/5000);
   if(specCache.key!==key){ specCache = {key, val: welch(t,g,fs)}; }
   const sp = specCache.val;
@@ -379,14 +383,17 @@ function draw(){
       {x:pk.map(p=>p.f),y:pk.map(p=>p.asd),type:"scatter",mode:"markers+text",marker:{size:7,color:COL[k]},text:pk.map(p=>" "+p.f.toFixed(2)),textposition:"top center",hoverinfo:"skip"},
       {x:[BAND[1],BAND[1]],y:[1,1e5],type:"scatter",mode:"lines",line:{width:1,dash:"dot",color:MUTED},hoverinfo:"skip"}
     ], Object.assign({}, base, {xaxis:{gridcolor:LINE,range:[0,31.3],title:{text:k===2?"frequency (Hz)":"",standoff:4}},
-       yaxis:{gridcolor:LINE,type:"log",nticks:5,range:[Math.log10(Math.max(1,Math.min(...y1)*0.7)),Math.log10(Math.max(...y1)*2)]}}), cfg);
+       yaxis: specMode==="linear"
+         ? {gridcolor:LINE,type:"linear",rangemode:"tozero",                         // scale to the tallest point above 0.3 Hz, so leftover drift near 0 Hz can't squash the plot
+            range:[0, 1.1*Math.max(...y1.filter((_,i)=>x1[i]>=BAND[0]))]}
+         : {gridcolor:LINE,type:"log",nticks:5,range:[Math.log10(Math.max(1,Math.min(...y1)*0.7)),Math.log10(Math.max(...y1)*2)]}}), cfg);
   }
 }
 
 // ---------- controls ----------
 const rb = document.getElementById("ranges");
 RANGES.forEach(([lbl],i)=>{ const b=document.createElement("button"); b.type="button"; b.textContent=lbl;
-  b.addEventListener("click",()=>{ rangeI=i; try{localStorage.setItem("xd-range",i)}catch(e){}; paintRanges(); draw(); refresh(); });
+  b.addEventListener("click",()=>{ rangeI=i; try{localStorage.setItem("xd-range-s",RANGES[i][1])}catch(e){}; paintRanges(); draw(); refresh(); });
   rb.appendChild(b); });
 function paintRanges(){ [...rb.children].forEach((b,i)=>{ b.classList.toggle("on",i===rangeI); b.setAttribute("aria-pressed",i===rangeI); }); }
 paintRanges();
@@ -394,6 +401,10 @@ const sc = document.getElementById("scale");
 function paintScale(){ [...sc.children].forEach(b=>{ const on=b.dataset.s===scaleMode; b.classList.toggle("on",on); b.setAttribute("aria-pressed",on); }); }
 [...sc.children].forEach(b=>b.addEventListener("click",()=>{ scaleMode=b.dataset.s; try{localStorage.setItem("xd-scale",scaleMode)}catch(e){}; paintScale(); draw(); }));
 paintScale();
+const spb = document.getElementById("spec");
+function paintSpec(){ [...spb.children].forEach(b=>{ const on=b.dataset.p===specMode; b.classList.toggle("on",on); b.setAttribute("aria-pressed",on); }); }
+[...spb.children].forEach(b=>b.addEventListener("click",()=>{ specMode=b.dataset.p; try{localStorage.setItem("xd-spec",specMode)}catch(e){}; paintSpec(); draw(); }));
+paintSpec();
 refresh(); setInterval(refresh, 10000);
 </script>
 </body>
