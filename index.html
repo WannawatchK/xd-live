@@ -44,15 +44,18 @@ h1{font-size:19px;margin:0}
 <header>
   <h1>Project XD Live · <span id="node">S01</span></h1>
   <div class="ranges" id="ranges" role="group" aria-label="Time range"></div>
+  <div class="ranges" id="scale" role="group" aria-label="Signal scale">
+    <button type="button" data-s="fixed">±2 g</button><button type="button" data-s="auto">Zoom (mg)</button>
+  </div>
   <span class="live" id="live" aria-live="polite">connecting…</span>
 </header>
 <div class="status" id="status">starting…</div>
 <div class="stats" id="stats"></div>
 <div class="grid" id="grid"></div>
 <div class="foot">
-  Signal: mean removed; long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
+  Signal: "±2 g" shows the acceleration itself in g (Z sits near +1 g because of gravity); "Zoom (mg)" removes the mean and zooms in to see small vibrations. Long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
   Spectrum: Welch average over the whole range (65 s pieces, Hann, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz.
-  LIVE: while this page is open it asks the node to also stream every second (about 1–2 s behind); the 10-second blocks fill in the history.
+  LIVE: while this page is open it asks the node to also send its newest samples every 0.25 s (about 0.5–1 s behind); the 10-second blocks fill in the history.
   Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
 </div>
 
@@ -67,6 +70,7 @@ const RANGES = [["10 min",600],["1 hour",3600],["4 hours",14400],["6 hours",2160
 const NSEG = 4096;                       // Welch piece, about 65 s at 62.7 Hz
 document.getElementById("node").textContent = NODE;
 
+let scaleMode = (()=>{ try { return localStorage.getItem("xd-scale") || "fixed"; } catch(e){ return "fixed"; } })();
 let rangeI = (()=>{ try { return +localStorage.getItem("xd-range") || 0; } catch(e){ return 0; } })();
 const blocks = new Map();                // key -> {utc: Float64Array (µs), g: Float32Array(n*3)}
 let approx = false, busy = false;
@@ -103,13 +107,14 @@ function parse(buf, createdUs){
   const v = new DataView(buf), magic = v.getUint32(0,true);
   if(magic!==0x58440002 && magic!==0x58440003) return null;          // skip fake-data tests
   const n = v.getUint32(8,true), hdr = magic===0x58440003 ? 40 : 32;
+  const code = (v.getUint32(28,true)>>8)&3, lsb = 256000/(1<<(Math.max(code,1)-1));   // ±2 / ±4 / ±8 g
   let utc0 = magic===0x58440003 ? Number(v.getBigInt64(32,true)) : 0;
   const lastDt = v.getUint32(hdr+16*(n-1)+12,true);
   if(utc0<=0){ utc0 = createdUs - lastDt - 1e6; approx = true; }   // no internet time: use upload time
   const utc = new Float64Array(n), g = new Float32Array(n*3);
   for(let i=0;i<n;i++){ const o=hdr+16*i;
     utc[i]=utc0+v.getUint32(o+12,true);
-    g[3*i]=v.getInt32(o,true)/256000/CAL[0]; g[3*i+1]=v.getInt32(o+4,true)/256000/CAL[1]; g[3*i+2]=v.getInt32(o+8,true)/256000/CAL[2]; }
+    g[3*i]=v.getInt32(o,true)/lsb/CAL[0]; g[3*i+1]=v.getInt32(o+4,true)/lsb/CAL[1]; g[3*i+2]=v.getInt32(o+8,true)/lsb/CAL[2]; }
   return {utc, g};
 }
 
@@ -127,7 +132,8 @@ async function refresh(){
         meta.set(f.name,{objs,newest,listed:Date.now()});
       }
     }
-    const horizon = now - (W+900)*1e6, todo = [];
+    const newestAll = Math.max(0,...[...meta.values()].map(m=>m.newest));
+    const horizon = (newestAll || now) - (W+900)*1e6, todo = [];      // the range ends at the newest data, even if the node is off
     for(const [s,m] of meta) for(const o of m.objs){
       const key = s+"/"+o.name, cu = Date.parse(o.created_at)*1000;
       if(cu>=horizon && !blocks.has(key)) todo.push([cu,key]);
@@ -155,10 +161,11 @@ async function refresh(){
 const liveEl = document.getElementById("live");
 function onLive(p){
   if(!p || !p.d || !p.u0) return;                        // u0 = 0 means the node has no internet time yet
+  const lsb = p.lsb || 256000;
   for(let i=0;i<p.d.length;i++){
     const t = p.u0 + p.d[i];
     if(t <= live.last) continue;
-    live.t.push(t); live.g.push([p.x[i]/256000/CAL[0], p.y[i]/256000/CAL[1], p.z[i]/256000/CAL[2]]);
+    live.t.push(t); live.g.push([p.x[i]/lsb/CAL[0], p.y[i]/lsb/CAL[1], p.z[i]/lsb/CAL[2]]);
     live.last = t;
   }
   const cut = live.last - 15*60e6;                       // keep 15 min
@@ -185,8 +192,10 @@ setInterval(()=>{
   if(age < 6){ liveEl.className="live on"; liveEl.textContent="LIVE · "+age.toFixed(1)+" s behind"; }
   else if(live.last){ liveEl.className="live wait"; liveEl.textContent="live paused ("+Math.round(age)+" s)"; }
   else { liveEl.className="live wait"; liveEl.textContent="waiting for node (up to 20 s)…"; }
-  if(liveDirty && RANGES[rangeI][1] <= 3600){ liveDirty=false; draw(); }   // short ranges redraw every second
 }, 1000);
+setInterval(()=>{                                          // short ranges redraw 4x a second while live data arrives
+  if(liveDirty && RANGES[rangeI][1] <= 3600 && !document.hidden){ liveDirty=false; draw(); }
+}, 250);
 
 // ---------- analysis ----------
 function gather(W){
@@ -242,7 +251,7 @@ const INK = css.getPropertyValue("--ink").trim(), LINE = css.getPropertyValue("-
 const grid = document.getElementById("grid");
 for(let k=0;k<3;k++){
   grid.insertAdjacentHTML("beforeend",
-    `<div class="card"><h3 id="ht${k}">${AX[k]} acceleration (mg)</h3><div class="plot" id="pt${k}"></div></div>
+    `<div class="card"><h3 id="ht${k}">${AX[k]} acceleration</h3><div class="plot" id="pt${k}"></div></div>
      <div class="card"><h3 id="hf${k}">${AX[k]} spectrum (µg/√Hz)</h3><div class="plot" id="pf${k}"></div></div>`);
 }
 const base = {margin:{l:46,r:10,t:6,b:30}, paper_bgcolor:"rgba(0,0,0,0)", plot_bgcolor:"rgba(0,0,0,0)",
@@ -261,20 +270,22 @@ function draw(){
   document.getElementById("stats").innerHTML =
     `<span>range <b>${name}</b></span><span>samples <b>${n.toLocaleString()}</b></span>`+
     `<span>coverage <b>${Math.min(100,Math.round(n/(W*fs)*100))} %</b></span><span>fs <b>${fs.toFixed(3)} Hz</b></span>`+
-    `<span>newest sample <b>${fmtTime(t1)}</b></span>`+(approx?`<span>older v2 blocks timed by upload (± a few s)</span>`:"");
+    `<span>newest sample <b>${fmtTime(t1)}</b></span>`+
+    `<span>|a| = √(x²+y²+z²) <b>${(()=>{let s=0; const m=Math.min(n,630); for(let i=n-m;i<n;i++) s+=Math.hypot(g[3*i],g[3*i+1],g[3*i+2]); return (s/m).toFixed(4);})()} g</b> (last 10 s)</span>`+(approx?`<span>older v2 blocks timed by upload (± a few s)</span>`:"");
   const xr = [fmtTime(t0), fmtTime(t1)];
   for(let k=0;k<3;k++){
     let mean=0; for(let i=0;i<n;i++) mean+=g[3*i+k]; mean/=n;
     let ss=0, mn=1e9, mx=-1e9; for(let i=0;i<n;i++){ const y=(g[3*i+k]-mean)*1000; ss+=y*y; if(y<mn)mn=y; if(y>mx)mx=y; }
-    document.getElementById("ht"+k).textContent = `${AX[k]} acceleration (mg) · mean ${mean>=0?"+":""}${mean.toFixed(4)} g · RMS ${Math.sqrt(ss/n).toFixed(3)} mg · peak-peak ${(mx-mn).toFixed(2)} mg`;
+    const fixed = scaleMode==="fixed", u = fixed ? 1 : 1000, off = fixed ? 0 : mean;   // g with gravity, or mg around the mean
+    document.getElementById("ht"+k).textContent = (fixed ? `${AX[k]} acceleration (g, ±2 g scale)` : `${AX[k]} acceleration (mg, mean removed)`) + ` · mean ${mean>=0?"+":""}${mean.toFixed(4)} g · RMS ${Math.sqrt(ss/n).toFixed(3)} mg · peak-peak ${(mx-mn).toFixed(2)} mg`;
     let traces;
     if(n<=6000){
       const xs=[], ys=[];
-      for(let i=0;i<n;i++){ if(i && t[i]-t[i-1]>3e6/fs){ xs.push(null); ys.push(null); } xs.push(fmtTime(t[i])); ys.push((g[3*i+k]-mean)*1000); }
+      for(let i=0;i<n;i++){ if(i && t[i]-t[i-1]>3e6/fs){ xs.push(null); ys.push(null); } xs.push(fmtTime(t[i])); ys.push((g[3*i+k]-off)*u); }
       traces=[{x:xs,y:ys,type:"scatter",mode:"lines",line:{width:1,color:COL[k]},hoverinfo:"x+y"}];
     }else{
       const NB=900, lo=new Array(NB).fill(null), hi=new Array(NB).fill(null), sum=new Float64Array(NB), cnt=new Uint32Array(NB);
-      for(let i=0;i<n;i++){ const b=Math.min(NB-1,Math.floor((t[i]-t0)/(t1-t0)*NB)); const y=(g[3*i+k]-mean)*1000;
+      for(let i=0;i<n;i++){ const b=Math.min(NB-1,Math.floor((t[i]-t0)/(t1-t0)*NB)); const y=(g[3*i+k]-off)*u;
         if(lo[b]===null||y<lo[b]) lo[b]=y; if(hi[b]===null||y>hi[b]) hi[b]=y; sum[b]+=y; cnt[b]++; }
       const xs=[...Array(NB)].map((_,b)=>fmtTime(t0+(b+0.5)*(t1-t0)/NB)), av=[...cnt].map((c,b)=>c?sum[b]/c:null);
       const px=[], py=[]; let b=0;
@@ -288,7 +299,8 @@ function draw(){
       traces=[{x:px,y:py,type:"scatter",mode:"lines",line:{width:0},fill:"toself",fillcolor:COL[k]+"55",hoverinfo:"skip"},
               {x:xs,y:av,type:"scatter",mode:"lines",line:{width:1,color:COL[k]},hoverinfo:"x+y",connectgaps:false}];
     }
-    Plotly.react("pt"+k, traces, Object.assign({}, base, {xaxis:{gridcolor:LINE,range:xr,type:"date"}, yaxis:{gridcolor:LINE,zeroline:false}}), cfg);
+    const ya = fixed ? {gridcolor:LINE,zeroline:true,zerolinecolor:LINE,range:[-2.2,2.2],tickvals:[-2,-1,0,1,2],fixedrange:true} : {gridcolor:LINE,zeroline:false};
+    Plotly.react("pt"+k, traces, Object.assign({}, base, {xaxis:{gridcolor:LINE,range:xr,type:"date"}, yaxis:ya}), cfg);
   }
   const every = {600:2,3600:5,14400:15,21600:20,43200:30,86400:60}[W];
   const key = rangeI+":"+Math.floor(t1/(every*1e6))+":"+Math.round(n/5000);
@@ -317,6 +329,10 @@ RANGES.forEach(([lbl],i)=>{ const b=document.createElement("button"); b.type="bu
   rb.appendChild(b); });
 function paintRanges(){ [...rb.children].forEach((b,i)=>{ b.classList.toggle("on",i===rangeI); b.setAttribute("aria-pressed",i===rangeI); }); }
 paintRanges();
+const sc = document.getElementById("scale");
+function paintScale(){ [...sc.children].forEach(b=>{ const on=b.dataset.s===scaleMode; b.classList.toggle("on",on); b.setAttribute("aria-pressed",on); }); }
+[...sc.children].forEach(b=>b.addEventListener("click",()=>{ scaleMode=b.dataset.s; try{localStorage.setItem("xd-scale",scaleMode)}catch(e){}; paintScale(); draw(); }));
+paintScale();
 refresh(); setInterval(refresh, 10000);
 </script>
 </body>
