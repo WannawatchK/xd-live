@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project XD Live</title>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-basic-dist-min@2.35.2/plotly-basic.min.js"></script>
+<style>
+/* Field-instrument dashboard: controls bar, three axis rows (signal | spectrum). */
+:root{
+  --bg:#F3F5F4; --surface:#FFFFFF; --ink:#16202A; --muted:#5B6873; --line:#D3DADE;
+  --accent:#2E5E8C; --x:#2E5E8C; --y:#2F7D4F; --z:#B4572E; --warn:#A8670E;
+  --f:system-ui,-apple-system,"Segoe UI",sans-serif; --mono:ui-monospace,Menlo,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#11171C; --surface:#18212A; --ink:#E6ECF0; --muted:#97A4AE; --line:#2E3A44;
+  --accent:#7FB0DE; --x:#7FB0DE; --y:#6CC28F; --z:#E39A6E; --warn:#E3A84E; color-scheme:dark;}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 var(--f)}
+header{padding:14px 16px 8px;display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center}
+h1{font-size:19px;margin:0}
+.ranges{display:flex;flex-wrap:wrap;gap:6px}
+.ranges button{font:inherit;font-size:13px;padding:5px 11px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--ink);cursor:pointer}
+.ranges button.on{background:var(--accent);border-color:var(--accent);color:var(--surface);font-weight:600}
+.ranges button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.status{font:12px var(--mono);color:var(--muted);padding:0 16px 8px}
+.stats{display:flex;flex-wrap:wrap;gap:6px 22px;padding:0 16px 10px;font-size:13px;color:var(--muted)}
+.stats b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+.grid{display:grid;grid-template-columns:1.6fr 1fr;gap:10px;padding:0 12px 16px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 6px 2px;min-width:0}
+.card h3{margin:2px 6px 0;font-size:12.5px;font-weight:600;color:var(--muted)}
+.plot{height:210px}
+@media (max-width:820px){.grid{grid-template-columns:1fr}.plot{height:190px}}
+.foot{padding:0 16px 22px;color:var(--muted);font-size:12px;max-width:900px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Project XD Live · <span id="node">S01</span></h1>
+  <div class="ranges" id="ranges" role="group" aria-label="Time range"></div>
+</header>
+<div class="status" id="status">starting…</div>
+<div class="stats" id="stats"></div>
+<div class="grid" id="grid"></div>
+<div class="foot">
+  Signal: mean removed; long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
+  Spectrum: Welch average over the whole range (65 s pieces, Hann, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz.
+  Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
+</div>
+
+<script>
+const URL_ = "https://nwpuskqpyzlbjosqfwns.supabase.co/storage/v1";
+const KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im53cHVza3FweXpsYmpvc3Fmd25zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMzNTM2ODcsImV4cCI6MjEwODkyOTY4N30.OVTio5RxzG6ByhSgCkMkJMd7ewPqrC4VVl61LwUNkZI";
+const BUCKET = "xd-raw";
+const NODE = new URLSearchParams(location.search).get("node") || "S01";
+const CAL = [0.98903, 0.99305, 1.01354];
+const H = {Authorization: "Bearer " + KEY, apikey: KEY};
+const RANGES = [["10 min",600],["1 hour",3600],["4 hours",14400],["6 hours",21600],["12 hours",43200],["1 day",86400]];
+const NSEG = 4096;                       // Welch piece, about 65 s at 62.7 Hz
+document.getElementById("node").textContent = NODE;
+
+let rangeI = (()=>{ try { return +localStorage.getItem("xd-range") || 0; } catch(e){ return 0; } })();
+const blocks = new Map();                // key -> {utc: Float64Array (µs), g: Float32Array(n*3)}
+let approx = false, busy = false;
+const setStatus = s => document.getElementById("status").textContent = s;
+
+// ---------- cache in IndexedDB (one copy of every block per browser) ----------
+let dbp = null;
+function db(){ if(!dbp) dbp = new Promise(res=>{ try{ const r=indexedDB.open("xd-cache",1); r.onupgradeneeded=()=>r.result.createObjectStore("b"); r.onsuccess=()=>res(r.result); r.onerror=()=>res(null);}catch(e){res(null)} }); return dbp; }
+async function cacheGet(k){ const d=await db(); if(!d) return null; return new Promise(r=>{ try{const q=d.transaction("b").objectStore("b").get(k); q.onsuccess=()=>r(q.result||null); q.onerror=()=>r(null);}catch(e){r(null)} }); }
+async function cachePut(k,v){ const d=await db(); if(!d) return; try{ d.transaction("b","readwrite").objectStore("b").put(v,k);}catch(e){} }
+
+// ---------- Supabase ----------
+async function list(prefix){
+  let out=[], off=0;
+  for(;;){
+    const r = await fetch(URL_+"/object/list/"+BUCKET,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},H),
+      body:JSON.stringify({prefix, limit:1000, offset:off, sortBy:{column:"name",order:"asc"}})});
+    if(!r.ok) throw new Error("list "+r.status);
+    const p = await r.json(); out = out.concat(p);
+    if(p.length<1000) return out; off+=1000;
+  }
+}
+async function getBlock(path){
+  let buf = await cacheGet(path);
+  if(!buf){
+    const r = await fetch(URL_+"/object/"+BUCKET+"/"+path,{headers:H});
+    if(!r.ok) throw new Error("get "+r.status);
+    buf = await r.arrayBuffer(); cachePut(path, buf);
+  }
+  return buf;
+}
+function parse(buf, createdUs){
+  const v = new DataView(buf), magic = v.getUint32(0,true);
+  if(magic!==0x58440002 && magic!==0x58440003) return null;          // skip fake-data tests
+  const n = v.getUint32(8,true), hdr = magic===0x58440003 ? 40 : 32;
+  let utc0 = magic===0x58440003 ? Number(v.getBigInt64(32,true)) : 0;
+  const lastDt = v.getUint32(hdr+16*(n-1)+12,true);
+  if(utc0<=0){ utc0 = createdUs - lastDt - 1e6; approx = true; }   // no internet time: use upload time
+  const utc = new Float64Array(n), g = new Float32Array(n*3);
+  for(let i=0;i<n;i++){ const o=hdr+16*i;
+    utc[i]=utc0+v.getUint32(o+12,true);
+    g[3*i]=v.getInt32(o,true)/256000/CAL[0]; g[3*i+1]=v.getInt32(o+4,true)/256000/CAL[1]; g[3*i+2]=v.getInt32(o+8,true)/256000/CAL[2]; }
+  return {utc, g};
+}
+
+const meta = new Map();   // session -> {objs, newest, listed}
+async function refresh(){
+  if(busy) return; busy = true;
+  try{
+    const W = RANGES[rangeI][1], now = Date.now()*1000;
+    const folders = (await list(NODE+"/")).filter(f=>f.id==null && !f.name.startsWith("boot"));
+    for(const f of folders){
+      const m = meta.get(f.name);
+      if(!m || now-m.newest<300e6 || Date.now()-m.listed>60000){
+        const objs = (await list(NODE+"/"+f.name+"/")).filter(o=>o.name.endsWith(".bin"));
+        const newest = Math.max(0,...objs.map(o=>Date.parse(o.created_at)*1000));
+        meta.set(f.name,{objs,newest,listed:Date.now()});
+      }
+    }
+    const horizon = now - (W+900)*1e6, todo = [];
+    for(const [s,m] of meta) for(const o of m.objs){
+      const key = s+"/"+o.name, cu = Date.parse(o.created_at)*1000;
+      if(cu>=horizon && !blocks.has(key)) todo.push([cu,key]);
+    }
+    todo.sort((a,b)=>b[0]-a[0]);                     // newest first
+    let done = 0;
+    for(let i=0;i<todo.length;i+=16){
+      const part = todo.slice(i,i+16);
+      const bufs = await Promise.all(part.map(([cu,key])=>getBlock(NODE+"/"+key).then(b=>[cu,key,b])));
+      for(const [cu,key,b] of bufs){ const p=parse(b,cu); blocks.set(key, p || {utc:new Float64Array(0),g:new Float32Array(0)}); done++; }
+      setStatus("loading "+done+"/"+todo.length+" blocks…");
+      if(i===0 || i%160===0) draw();
+    }
+    // forget blocks older than 1 day + 1 h
+    let newestT = 0; for(const b of blocks.values()) if(b.utc.length) newestT=Math.max(newestT,b.utc[b.utc.length-1]);
+    for(const [k,b] of blocks) if(b.utc.length && b.utc[b.utc.length-1] < newestT-(86400+3600)*1e6) blocks.delete(k);
+    const newestUp = Math.max(0,...[...meta.values()].map(m=>m.newest));
+    setStatus(meta.size+" recordings · newest upload "+Math.max(0,Math.round((now-newestUp)/1e6))+" s ago · refreshes every 10 s");
+    draw();
+  }catch(e){ setStatus("cannot reach Supabase ("+e.message+"), retrying…"); }
+  busy = false;
+}
+
+// ---------- analysis ----------
+function gather(W){
+  const parts = [...blocks.values()].filter(b=>b.utc.length);
+  if(!parts.length) return null;
+  let t1 = 0; for(const b of parts) t1 = Math.max(t1, b.utc[b.utc.length-1]);
+  const t0 = t1 - W*1e6;
+  const sel = parts.filter(b=>b.utc[b.utc.length-1]>=t0).sort((a,b)=>a.utc[0]-b.utc[0]);
+  let n=0; for(const b of sel) for(let i=0;i<b.utc.length;i++) if(b.utc[i]>=t0) n++;
+  const t = new Float64Array(n), g = new Float32Array(n*3); let k=0;
+  for(const b of sel) for(let i=0;i<b.utc.length;i++) if(b.utc[i]>=t0){ t[k]=b.utc[i]; g[3*k]=b.g[3*i]; g[3*k+1]=b.g[3*i+1]; g[3*k+2]=b.g[3*i+2]; k++; }
+  return {t, g, t0, t1};
+}
+function fft(re, im){                                 // in-place radix-2
+  const n=re.length;
+  for(let i=1,j=0;i<n;i++){ let b=n>>1; for(;j&b;b>>=1) j^=b; j^=b; if(i<j){ [re[i],re[j]]=[re[j],re[i]]; [im[i],im[j]]=[im[j],im[i]]; } }
+  for(let len=2;len<=n;len<<=1){ const a=-2*Math.PI/len, wr=Math.cos(a), wi=Math.sin(a);
+    for(let i=0;i<n;i+=len){ let cr=1,ci=0;
+      for(let j=0;j<len/2;j++){ const ur=re[i+j],ui=im[i+j], xr=re[i+j+len/2]*cr-im[i+j+len/2]*ci, xi=re[i+j+len/2]*ci+im[i+j+len/2]*cr;
+        re[i+j]=ur+xr; im[i+j]=ui+xi; re[i+j+len/2]=ur-xr; im[i+j+len/2]=ui-xi; const nr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=nr; } } }
+}
+function welch(t, g, fs){
+  const n=NSEG, step=n/2, w=new Float64Array(n); let ws=0;
+  for(let i=0;i<n;i++){ w[i]=0.5-0.5*Math.cos(2*Math.PI*i/(n-1)); ws+=w[i]*w[i]; }
+  const acc=[new Float64Array(n/2+1),new Float64Array(n/2+1),new Float64Array(n/2+1)];
+  const re=new Float64Array(n), im=new Float64Array(n); let pieces=0;
+  let s0=0;
+  const runs=[]; for(let i=1;i<=t.length;i++){ if(i===t.length || t[i]-t[i-1]>3e6/fs){ runs.push([s0,i]); s0=i; } }
+  for(const [a,b] of runs) for(let s=a;s+n<=b;s+=step){
+    for(let ax=0;ax<3;ax++){
+      let m=0; for(let i=0;i<n;i++) m+=g[3*(s+i)+ax]; m/=n;
+      for(let i=0;i<n;i++){ re[i]=(g[3*(s+i)+ax]-m)*w[i]; im[i]=0; }
+      fft(re,im); const A=acc[ax]; for(let f=0;f<=n/2;f++) A[f]+=re[f]*re[f]+im[f]*im[f];
+    }
+    pieces++;
+  }
+  if(!pieces) return null;
+  const scale=2/(fs*ws), f=[...Array(n/2+1)].map((_,i)=>i*fs/n);
+  return {f, asd: acc.map(A=>Array.from(A,v=>Math.sqrt(v/pieces*scale)*1e6)), pieces};
+}
+
+// ---------- drawing ----------
+const AX = ["X","Y","Z"], css = getComputedStyle(document.documentElement);
+const COL = [css.getPropertyValue("--x").trim(), css.getPropertyValue("--y").trim(), css.getPropertyValue("--z").trim()];
+const INK = css.getPropertyValue("--ink").trim(), LINE = css.getPropertyValue("--line").trim(), MUTED = css.getPropertyValue("--muted").trim();
+const grid = document.getElementById("grid");
+for(let k=0;k<3;k++){
+  grid.insertAdjacentHTML("beforeend",
+    `<div class="card"><h3 id="ht${k}">${AX[k]} acceleration (mg)</h3><div class="plot" id="pt${k}"></div></div>
+     <div class="card"><h3 id="hf${k}">${AX[k]} spectrum (µg/√Hz)</h3><div class="plot" id="pf${k}"></div></div>`);
+}
+const base = {margin:{l:46,r:10,t:6,b:30}, paper_bgcolor:"rgba(0,0,0,0)", plot_bgcolor:"rgba(0,0,0,0)",
+  font:{size:11,color:INK}, showlegend:false, xaxis:{gridcolor:LINE,zeroline:false}, yaxis:{gridcolor:LINE,zeroline:false}};
+const cfg = {displayModeBar:false, responsive:true};
+const fmtTime = us => new Date(us/1000+7*3600e3).toISOString().replace("T"," ").slice(0,19);   // Thailand time
+let specCache = {key:null, val:null};
+
+function draw(){
+  const [name,W] = RANGES[rangeI];
+  const d = gather(W);
+  if(!d || d.t.length<20){ document.getElementById("stats").innerHTML=""; return; }
+  const {t,g,t0,t1} = d, n=t.length;
+  let dsum=0, dn=0; for(let i=1;i<n;i++){ const x=t[i]-t[i-1]; if(x<3e5/62.5*10 && x>0){ dsum+=x; dn++; } }
+  const fs = dn? 1e6/(dsum/dn) : 62.5;
+  document.getElementById("stats").innerHTML =
+    `<span>range <b>${name}</b></span><span>samples <b>${n.toLocaleString()}</b></span>`+
+    `<span>coverage <b>${Math.min(100,Math.round(n/(W*fs)*100))} %</b></span><span>fs <b>${fs.toFixed(3)} Hz</b></span>`+
+    `<span>newest sample <b>${fmtTime(t1)}</b></span>`+(approx?`<span>older v2 blocks timed by upload (± a few s)</span>`:"");
+  const xr = [fmtTime(t0), fmtTime(t1)];
+  for(let k=0;k<3;k++){
+    let mean=0; for(let i=0;i<n;i++) mean+=g[3*i+k]; mean/=n;
+    let ss=0, mn=1e9, mx=-1e9; for(let i=0;i<n;i++){ const y=(g[3*i+k]-mean)*1000; ss+=y*y; if(y<mn)mn=y; if(y>mx)mx=y; }
+    document.getElementById("ht"+k).textContent = `${AX[k]} acceleration (mg) · mean ${mean>=0?"+":""}${mean.toFixed(4)} g · RMS ${Math.sqrt(ss/n).toFixed(3)} mg · peak-peak ${(mx-mn).toFixed(2)} mg`;
+    let traces;
+    if(n<=6000){
+      const xs=[], ys=[];
+      for(let i=0;i<n;i++){ if(i && t[i]-t[i-1]>3e6/fs){ xs.push(null); ys.push(null); } xs.push(fmtTime(t[i])); ys.push((g[3*i+k]-mean)*1000); }
+      traces=[{x:xs,y:ys,type:"scatter",mode:"lines",line:{width:1,color:COL[k]},hoverinfo:"x+y"}];
+    }else{
+      const NB=900, lo=new Array(NB).fill(null), hi=new Array(NB).fill(null), sum=new Float64Array(NB), cnt=new Uint32Array(NB);
+      for(let i=0;i<n;i++){ const b=Math.min(NB-1,Math.floor((t[i]-t0)/(t1-t0)*NB)); const y=(g[3*i+k]-mean)*1000;
+        if(lo[b]===null||y<lo[b]) lo[b]=y; if(hi[b]===null||y>hi[b]) hi[b]=y; sum[b]+=y; cnt[b]++; }
+      const xs=[...Array(NB)].map((_,b)=>fmtTime(t0+(b+0.5)*(t1-t0)/NB)), av=[...cnt].map((c,b)=>c?sum[b]/c:null);
+      const px=[], py=[]; let b=0;
+      while(b<NB){
+        if(!cnt[b]){ b++; continue; }
+        let e=b; while(e<NB && cnt[e]) e++;                    // one stretch with data: bins b..e-1
+        for(let j=b;j<e;j++){ px.push(xs[j]); py.push(hi[j]); }
+        for(let j=e-1;j>=b;j--){ px.push(xs[j]); py.push(lo[j]); }
+        px.push(null); py.push(null); b=e;
+      }
+      traces=[{x:px,y:py,type:"scatter",mode:"lines",line:{width:0},fill:"toself",fillcolor:COL[k]+"55",hoverinfo:"skip"},
+              {x:xs,y:av,type:"scatter",mode:"lines",line:{width:1,color:COL[k]},hoverinfo:"x+y",connectgaps:false}];
+    }
+    Plotly.react("pt"+k, traces, Object.assign({}, base, {xaxis:{gridcolor:LINE,range:xr,type:"date"}, yaxis:{gridcolor:LINE,zeroline:false}}), cfg);
+  }
+  const every = {600:2,3600:5,14400:15,21600:20,43200:30,86400:60}[W];
+  const key = rangeI+":"+Math.floor(t1/(every*1e6))+":"+Math.round(n/5000);
+  if(specCache.key!==key){ specCache = {key, val: welch(t,g,fs)}; }
+  const sp = specCache.val;
+  for(let k=0;k<3;k++){
+    if(!sp){ document.getElementById("hf"+k).textContent=`${AX[k]} spectrum: needs 65 s of unbroken data`; Plotly.purge("pf"+k); continue; }
+    const f=sp.f, a=sp.asd[k]; let bi=0, bv=0; const band=[];
+    for(let i=0;i<f.length;i++) if(f[i]>0.4 && f[i]<25){ band.push(a[i]); if(a[i]>bv){bv=a[i];bi=i;} }
+    band.sort((x,y)=>x-y); const med=band[band.length>>1];
+    document.getElementById("hf"+k).textContent = `${AX[k]} spectrum (µg/√Hz) · ${sp.pieces} pieces · peak ${f[bi].toFixed(2)} Hz, ${(bv/med).toFixed(1)}× floor`;
+    const x1=[], y1=[]; for(let i=1;i<f.length;i++){ x1.push(f[i]); y1.push(a[i]); }
+    Plotly.react("pf"+k, [
+      {x:x1,y:y1,type:"scatter",mode:"lines",line:{width:1,color:COL[k]},hovertemplate:"%{x:.2f} Hz<br>%{y:.1f} µg/√Hz<extra></extra>"},
+      {x:[0,31.3],y:[22.5,22.5],type:"scatter",mode:"lines",line:{width:1,dash:"dash",color:MUTED},hoverinfo:"skip"},
+      {x:[f[bi]],y:[bv],type:"scatter",mode:"markers+text",marker:{size:7,color:COL[k]},text:[" "+f[bi].toFixed(2)+" Hz"],textposition:"middle right",hoverinfo:"skip"}
+    ], Object.assign({}, base, {xaxis:{gridcolor:LINE,range:[0,31.3],title:{text:k===2?"frequency (Hz)":"",standoff:4}},
+       yaxis:{gridcolor:LINE,type:"log",nticks:5}}), cfg);
+  }
+}
+
+// ---------- controls ----------
+const rb = document.getElementById("ranges");
+RANGES.forEach(([lbl],i)=>{ const b=document.createElement("button"); b.type="button"; b.textContent=lbl;
+  b.addEventListener("click",()=>{ rangeI=i; try{localStorage.setItem("xd-range",i)}catch(e){}; paintRanges(); draw(); refresh(); });
+  rb.appendChild(b); });
+function paintRanges(){ [...rb.children].forEach((b,i)=>{ b.classList.toggle("on",i===rangeI); b.setAttribute("aria-pressed",i===rangeI); }); }
+paintRanges();
+refresh(); setInterval(refresh, 10000);
+</script>
+</body>
+</html>
