@@ -26,6 +26,12 @@ h1{font-size:19px;margin:0}
 .ranges button.on{background:var(--accent);border-color:var(--accent);color:var(--surface);font-weight:600}
 .ranges button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .status{font:12px var(--mono);color:var(--muted);padding:0 16px 8px}
+.auto{font-size:12.5px;color:var(--muted);align-self:center}
+.auto select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:4px 8px;margin-left:4px}
+.auto select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ranges button:disabled{opacity:.45;cursor:default}
+.since{font-size:12.5px;color:var(--muted);align-self:center;font-variant-numeric:tabular-nums}
+.since b{color:var(--ink)}
 .live{font:600 12.5px var(--f);padding:3px 10px;border-radius:999px;background:var(--line);color:var(--muted)}
 .live.on{background:#C62828;color:#fff}
 .live.on::before{content:"● "}
@@ -50,6 +56,13 @@ h1{font-size:19px;margin:0}
   <div class="ranges" id="spec" role="group" aria-label="Spectrum scale">
     <button type="button" data-p="log">Spectrum log</button><button type="button" data-p="linear">Spectrum linear</button>
   </div>
+  <div class="ranges" id="recgrp" role="group" aria-label="Recording window">
+    <button type="button" id="startBtn" title="Analyse only data from now on (older data stays stored, just ignored)">Start</button><button type="button" id="stopBtn" title="Freeze the window: data after this moment is ignored">Stop</button><button type="button" id="allBtn" title="Back to the normal time range">All data</button>
+    <label class="auto">Auto-stop <select id="autoSel" aria-label="Auto-stop after">
+      <option value="0">off</option><option value="1">1 min</option><option value="2">2 min</option><option value="5">5 min</option><option value="10">10 min</option><option value="15">15 min</option><option value="20">20 min</option><option value="30">30 min</option><option value="60">1 h</option><option value="120">2 h</option>
+    </select></label>
+    <span class="since" id="since" aria-live="polite"></span>
+  </div>
   <span class="live" id="live" aria-live="polite">connecting…</span>
 </header>
 <div class="status" id="status">starting…</div>
@@ -58,6 +71,7 @@ h1{font-size:19px;margin:0}
 <div class="foot">
   Signal: "±2 g" shows the acceleration itself in g (Z sits near +1 g because of gravity); "Zoom (mg)" applies a zero-phase 0.2 Hz high-pass (removes gravity, drift and slow tilt) and zooms in to see small vibrations. Long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
   Spectrum: Welch average over the whole range (65 s pieces = 0.015 Hz resolution, linear detrend, Hann window, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz; "Spectrum linear" shows peaks the way single-FFT plots do (tall peaks, floor flattened near zero); "Spectrum log" keeps weak modes and the noise floor visible; dotted line = 15 Hz, top of the mode search band (the chip's own filter cuts off near 15.6 Hz). Labels = up to 5 peaks in 0.3–15 Hz at least 3× above the local floor, refined between bins. A peak is a candidate mode: check it shows on every node and stays put across recordings.
+  Start / Stop: Start analyses only data from that moment (older data stays stored, just ignored); Stop freezes the window so you can read the result; Auto-stop stops by itself after the chosen time; All data goes back to the normal time range. While a window is set, the range buttons are ignored. The first 65 s use 16 s spectrum pieces (0.06 Hz), then 65 s pieces (0.015 Hz). The window is kept per node across reloads.
   LIVE: while this page is open it asks the node to also send its newest samples every 0.25 s (about 0.5–1 s behind); the 10-second blocks fill in the history.
   Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
 </div>
@@ -74,6 +88,12 @@ const NSEG = 4096;                       // Welch piece, about 65 s at 62.7 Hz
 document.getElementById("node").textContent = NODE;
 
 let specMode = (()=>{ try { return localStorage.getItem("xd-spec") || "log"; } catch(e){ return "log"; } })();   // spectrum y-axis: log (noise floor, weak modes) or linear (peaks stand out)
+// ---- recording window: Start / Stop / Auto-stop (times in UTC µs, kept per node across reloads) ----
+const REC_KEY = "xd-rec-" + NODE;
+let rec = (()=>{ try { const r = JSON.parse(localStorage.getItem(REC_KEY)); if(r && typeof r==="object") return {start:r.start||null, stop:r.stop||null, auto:+r.auto||0}; } catch(e){} return {start:null, stop:null, auto:0}; })();
+const saveRec = () => { try{ localStorage.setItem(REC_KEY, JSON.stringify(rec)); }catch(e){} };
+const recEnd = () => rec.start ? (rec.stop || (rec.auto ? rec.start + rec.auto*60e6 : null)) : null;   // null = still open
+const recRunning = () => !!rec.start && (recEnd()===null || Date.now()*1000 < recEnd());
 let scaleMode = (()=>{ try { return localStorage.getItem("xd-scale") || "fixed"; } catch(e){ return "fixed"; } })();
 let rangeI = (()=>{ try { const i = RANGES.findIndex(r=>r[1]===+localStorage.getItem("xd-range-s")); return i<0 ? 0 : i; } catch(e){ return 0; } })();   // saved by seconds, so adding buttons never shifts it
 const blocks = new Map();                // key -> {utc: Float64Array (µs), g: Float32Array(n*3)}
@@ -137,7 +157,8 @@ async function refresh(){
       }
     }
     const newestAll = Math.max(0,...[...meta.values()].map(m=>m.newest));
-    const horizon = (newestAll || now) - (W+900)*1e6, todo = [];      // the range ends at the newest data, even if the node is off
+    let horizon = (newestAll || now) - (W+900)*1e6; const todo = [];
+    if(rec.start) horizon = Math.min(horizon, rec.start - 900e6);           // keep the whole Start→Stop window loaded      // the range ends at the newest data, even if the node is off
     for(const [s,m] of meta) for(const o of m.objs){
       const key = s+"/"+o.name, cu = Date.parse(o.created_at)*1000;
       if(cu>=horizon && !blocks.has(key)) todo.push([cu,key]);
@@ -198,7 +219,7 @@ setInterval(()=>{
   else { liveEl.className="live wait"; liveEl.textContent="waiting for node (up to 20 s)…"; }
 }, 1000);
 setInterval(()=>{                                          // short ranges redraw 4x a second while live data arrives
-  if(liveDirty && RANGES[rangeI][1] <= 3600 && !document.hidden){ liveDirty=false; draw(); }
+  if(liveDirty && (RANGES[rangeI][1] <= 3600 || recRunning()) && !document.hidden){ liveDirty=false; draw(); }
 }, 250);
 
 // ---------- analysis ----------
@@ -212,12 +233,15 @@ function gather(W){
     parts.push({utc:ut, g:ug});
   }
   if(!parts.length) return null;
-  let t1 = 0; for(const b of parts) t1 = Math.max(t1, b.utc[b.utc.length-1]);
-  const t0 = t1 - W*1e6;
-  const sel = parts.filter(b=>b.utc[b.utc.length-1]>=t0).sort((a,b)=>a.utc[0]-b.utc[0]);
-  let n=0; for(const b of sel) for(let i=0;i<b.utc.length;i++) if(b.utc[i]>=t0) n++;
+  const tEnd = recEnd() || Infinity;                                       // after Stop / auto-stop, later samples are ignored
+  let t1 = 0; for(const b of parts) for(let i=b.utc.length-1;i>=0;i--) if(b.utc[i]<=tEnd){ t1 = Math.max(t1, b.utc[i]); break; }
+  const t0 = rec.start ? rec.start : t1 - W*1e6;                           // with Start: the whole Start→Stop window, whatever the range button
+  const inWin = u => u>=t0 && u<=tEnd;
+  const sel = parts.filter(b=>b.utc[b.utc.length-1]>=t0 && b.utc[0]<=tEnd).sort((a,b)=>a.utc[0]-b.utc[0]);
+  let n=0; for(const b of sel) for(let i=0;i<b.utc.length;i++) if(inWin(b.utc[i])) n++;
+  if(!n) return null;
   const t = new Float64Array(n), g = new Float32Array(n*3); let k=0;
-  for(const b of sel) for(let i=0;i<b.utc.length;i++) if(b.utc[i]>=t0){ t[k]=b.utc[i]; g[3*k]=b.g[3*i]; g[3*k+1]=b.g[3*i+1]; g[3*k+2]=b.g[3*i+2]; k++; }
+  for(const b of sel) for(let i=0;i<b.utc.length;i++) if(inWin(b.utc[i])){ t[k]=b.utc[i]; g[3*k]=b.g[3*i]; g[3*k+1]=b.g[3*i+1]; g[3*k+2]=b.g[3*i+2]; k++; }
   return {t, g, t0, t1};
 }
 function fft(re, im){                                 // in-place radix-2
@@ -236,11 +260,11 @@ function runsOf(t, fs){                   // split into unbroken stretches (gap 
   for(let i=1;i<=t.length;i++){ if(i===t.length || t[i]-t[i-1]>3e6/fs){ runs.push([s0,i]); s0=i; } }
   return runs;
 }
-function welch(t, g, fs){
+function welch(t, g, fs, nseg=NSEG){
   // Welch PSD: 4096-sample pieces (~65 s, 0.015 Hz bins), 50 % overlap,
   // each piece: remove a straight-line trend (drift, slow tilt) -> periodic Hann window -> FFT -> |X|²,
   // then average the pieces. Output is ASD in µg/√Hz (one-sided), same scaling as scipy.signal.welch.
-  const n=NSEG, step=n/2, w=new Float64Array(n); let ws=0;
+  const n=nseg, step=n/2, w=new Float64Array(n); let ws=0;
   for(let i=0;i<n;i++){ w[i]=0.5-0.5*Math.cos(2*Math.PI*i/n); ws+=w[i]*w[i]; }   // periodic Hann (scipy default)
   const xm=(n-1)/2; let sxx=0; for(let i=0;i<n;i++) sxx+=(i-xm)*(i-xm);
   const acc=[new Float64Array(n/2+1),new Float64Array(n/2+1),new Float64Array(n/2+1)];
@@ -331,19 +355,24 @@ function specAxis(y, x){
   }
   let lo=Infinity, hi=0; for(const v of y){ if(v>0 && v<lo) lo=v; if(v>hi) hi=v; }
   const r0=Math.log10(Math.max(1, lo*0.7)), r1=Math.log10(hi*3);                   // log axis range is given in powers of 10
-  const tv=[]; for(let e=Math.floor(r0); e<=Math.ceil(r1); e++) for(const m of [1,2,5]){ const v=m*10**e; if(Math.log10(v)>=r0 && Math.log10(v)<=r1) tv.push(v); }
+  const tv=[]; for(let e=Math.floor(r0); e<=Math.ceil(r1); e++) for(const m of (r1-r0 > 3 ? [1] : [1,2,5])){ const v=m*10**e; if(Math.log10(v)>=r0 && Math.log10(v)<=r1) tv.push(v); }
   return Object.assign(common, {type:"log", range:[r0, r1], tickvals:tv, ticktext:tv.map(v=>v.toLocaleString("en-US"))});   // full numbers (200, 500), never a bare "2" or "5"
 }
 function draw(){
   const [name,W] = RANGES[rangeI];
   const d = gather(W);
-  if(!d || d.t.length<20){ document.getElementById("stats").innerHTML=""; return; }
+  paintRec(d ? d.t1 : null);
+  if(!d || d.t.length<20){
+    document.getElementById("stats").innerHTML = rec.start ? `<span>no data yet after Start (${fmtTime(rec.start)})…</span>` : "";
+    for(let k=0;k<3;k++){ Plotly.purge("pt"+k); Plotly.purge("pf"+k); document.getElementById("hf"+k).textContent=`${AX[k]} spectrum`; document.getElementById("ht"+k).textContent=`${AX[k]} acceleration`; }
+    return;
+  }
   const {t,g,t0,t1} = d, n=t.length;
   let dsum=0, dn=0; for(let i=1;i<n;i++){ const x=t[i]-t[i-1]; if(x<3e5/62.5*10 && x>0){ dsum+=x; dn++; } }
   const fs = dn? 1e6/(dsum/dn) : 62.5;
   document.getElementById("stats").innerHTML =
-    `<span>range <b>${name}</b></span><span>samples <b>${n.toLocaleString()}</b></span>`+
-    `<span>coverage <b>${Math.min(100,Math.round(n/(W*fs)*100))} %</b></span><span>fs <b>${fs.toFixed(3)} Hz</b></span>`+
+    `<span>range <b>${rec.start ? (recRunning() ? "Start → now" : "Start → Stop") : name}</b></span><span>samples <b>${n.toLocaleString()}</b></span>`+
+    `<span>coverage <b>${Math.min(100,Math.round(n/((t1-t0)/1e6*fs)*100))} %</b></span><span>fs <b>${fs.toFixed(3)} Hz</b></span>`+
     `<span>newest sample <b>${fmtTime(t1)}</b></span>`+
     `<span>|a| = √(x²+y²+z²) <b>${(()=>{let s=0; const m=Math.min(n,630); for(let i=n-m;i<n;i++) s+=Math.hypot(g[3*i],g[3*i+1],g[3*i+2]); return (s/m).toFixed(4);})()} g</b> (last 10 s)</span>`+(approx?`<span>older v2 blocks timed by upload (± a few s)</span>`:"");
   const xr = [fmtTime(t0), fmtTime(t1)];
@@ -381,14 +410,18 @@ function draw(){
     const ya = fixed ? {gridcolor:LINE,zeroline:true,zerolinecolor:LINE,range:[-2.2,2.2],tickvals:[-2,-1,0,1,2],fixedrange:true} : {gridcolor:LINE,zeroline:false};
     Plotly.react("pt"+k, traces, Object.assign({}, base, {xaxis:{gridcolor:LINE,range:xr,type:"date"}, yaxis:ya}), cfg);
   }
-  const every = {600:2,1800:3,3600:5,14400:15,21600:20,43200:30,86400:60}[W];
-  const key = rangeI+":"+Math.floor(t1/(every*1e6))+":"+Math.round(n/5000);
-  if(specCache.key!==key){ specCache = {key, val: welch(t,g,fs)}; }
+  const every = recRunning() ? 2 : {600:2,1800:3,3600:5,14400:15,21600:20,43200:30,86400:60}[W];
+  const key = rangeI+":"+rec.start+":"+recEnd()+":"+Math.floor(t1/(every*1e6))+":"+Math.round(n/5000);
+  if(specCache.key!==key){
+    // 4096-sample pieces (65 s, 0.015 Hz) when there is enough data; right after Start fall back to 1024 (16 s, 0.06 Hz)
+    let v = welch(t,g,fs); if(!v){ v = welch(t,g,fs,1024); if(v) v.short = true; }
+    specCache = {key, val: v};
+  }
   const sp = specCache.val;
   for(let k=0;k<3;k++){
-    if(!sp){ document.getElementById("hf"+k).textContent=`${AX[k]} spectrum: needs 65 s of unbroken data`; Plotly.purge("pf"+k); continue; }
+    if(!sp){ document.getElementById("hf"+k).textContent=`${AX[k]} spectrum: needs 16 s of unbroken data`; Plotly.purge("pf"+k); continue; }
     const f=sp.f, a=sp.asd[k], pk=findPeaks(f,a);
-    document.getElementById("hf"+k).textContent = `${AX[k]} spectrum (µg/√Hz, ${specMode} scale) · ${sp.pieces} pieces · ` +
+    document.getElementById("hf"+k).textContent = `${AX[k]} spectrum (µg/√Hz, ${specMode} scale) · ${sp.pieces} pieces · Δf ${(sp.f[1]).toFixed(3)} Hz${sp.short?" (short; 0.015 Hz after 65 s)":""} · ` +
       (pk.length ? "peaks " + pk.map(p=>`${p.f.toFixed(2)} Hz (${p.snr.toFixed(0)}×)`).join(", ") : `no clear peak in ${BAND[0]}–${BAND[1]} Hz`);
     const x1=[], y1=[]; for(let i=1;i<f.length;i++){ x1.push(f[i]); y1.push(a[i]); }
     Plotly.react("pf"+k, [
@@ -416,6 +449,41 @@ const spb = document.getElementById("spec");
 function paintSpec(){ [...spb.children].forEach(b=>{ const on=b.dataset.p===specMode; b.classList.toggle("on",on); b.setAttribute("aria-pressed",on); }); }
 [...spb.children].forEach(b=>b.addEventListener("click",()=>{ specMode=b.dataset.p; try{localStorage.setItem("xd-spec",specMode)}catch(e){}; paintSpec(); draw(); }));
 paintSpec();
+const startBtn = document.getElementById("startBtn"), stopBtn = document.getElementById("stopBtn"), allBtn = document.getElementById("allBtn");
+const autoSel = document.getElementById("autoSel"), sinceEl = document.getElementById("since");
+const mmss = sec => `${Math.floor(sec/60)}:${String(Math.floor(sec%60)).padStart(2,"0")}`;
+let wasRunning = recRunning();
+function paintRec(){
+  const run = recRunning(), on = !!rec.start, nowUs = Date.now()*1000;
+  startBtn.classList.toggle("on", run); startBtn.setAttribute("aria-pressed", run);
+  stopBtn.disabled = !run;
+  allBtn.classList.toggle("on", !on); allBtn.setAttribute("aria-pressed", !on);
+  autoSel.value = String(rec.auto);
+  if(!on){ sinceEl.textContent = ""; return; }
+  const from = fmtTime(rec.start).slice(11);
+  if(run){
+    const left = recEnd() ? ` · auto-stop in <b>${mmss((recEnd()-nowUs)/1e6)}</b>` : "";
+    sinceEl.innerHTML = `recording since <b>${from}</b> · <b>${mmss((nowUs-rec.start)/1e6)}</b>${left}`;
+  } else {
+    const end = recEnd(), how = rec.stop ? "stopped" : "auto-stopped";
+    sinceEl.innerHTML = `<b>${from} → ${fmtTime(end).slice(11)}</b> · ${mmss((end-rec.start)/1e6)} · ${how}`;
+  }
+}
+setInterval(()=>{                                        // tick the clock; redraw once when the auto-stop time passes
+  paintRec();
+  const run = recRunning(); if(wasRunning && !run){ specCache = {key:null, val:null}; draw(); } wasRunning = run;
+}, 1000);
+function recChanged(){ saveRec(); wasRunning = recRunning(); specCache = {key:null, val:null}; paintRec(); draw(); }
+startBtn.addEventListener("click", ()=>{
+  // start = now, or the newest sample if the node's clock is ahead of this browser
+  let newest = 0; for(const b of blocks.values()) if(b.utc.length) newest = Math.max(newest, b.utc[b.utc.length-1]);
+  if(live.t.length) newest = Math.max(newest, live.t[live.t.length-1]);
+  rec.start = Math.max(Date.now()*1000, newest); rec.stop = null; recChanged();
+});
+stopBtn.addEventListener("click", ()=>{ if(recRunning()){ rec.stop = Date.now()*1000; recChanged(); } });
+allBtn.addEventListener("click", ()=>{ rec.start = null; rec.stop = null; recChanged(); });
+autoSel.addEventListener("change", ()=>{ rec.auto = +autoSel.value; recChanged(); });   // also applies to a recording already running
+paintRec();
 refresh(); setInterval(refresh, 10000);
 </script>
 </body>
