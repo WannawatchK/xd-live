@@ -53,8 +53,8 @@ h1{font-size:19px;margin:0}
 <div class="stats" id="stats"></div>
 <div class="grid" id="grid"></div>
 <div class="foot">
-  Signal: "±2 g" shows the acceleration itself in g (Z sits near +1 g because of gravity); "Zoom (mg)" removes the mean and zooms in to see small vibrations. Long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
-  Spectrum: Welch average over the whole range (65 s pieces, Hann, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz.
+  Signal: "±2 g" shows the acceleration itself in g (Z sits near +1 g because of gravity); "Zoom (mg)" applies a zero-phase 0.2 Hz high-pass (removes gravity, drift and slow tilt) and zooms in to see small vibrations. Long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
+  Spectrum: Welch average over the whole range (65 s pieces = 0.015 Hz resolution, linear detrend, Hann window, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz; dotted line = 15 Hz, top of the mode search band (the chip's own filter cuts off near 15.6 Hz). Labels = up to 5 peaks in 0.3–15 Hz at least 3× above the local floor, refined between bins. A peak is a candidate mode: check it shows on every node and stays put across recordings.
   LIVE: while this page is open it asks the node to also send its newest samples every 0.25 s (about 0.5–1 s behind); the 10-second blocks fill in the history.
   Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
 </div>
@@ -224,24 +224,80 @@ function fft(re, im){                                 // in-place radix-2
       for(let j=0;j<len/2;j++){ const ur=re[i+j],ui=im[i+j], xr=re[i+j+len/2]*cr-im[i+j+len/2]*ci, xi=re[i+j+len/2]*ci+im[i+j+len/2]*cr;
         re[i+j]=ur+xr; im[i+j]=ui+xi; re[i+j+len/2]=ur-xr; im[i+j+len/2]=ui-xi; const nr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=nr; } } }
 }
+// ===== spectrum analysis (for natural frequencies) =====
+const BAND = [0.3, 15];                   // search band for modes (Hz); ADXL355 at ODR 62.5 Hz cuts off near 15.6 Hz
+const HP_HZ = 0.2;                        // high-pass for the Zoom (mg) time plot only, removes drift and tilt
+function runsOf(t, fs){                   // split into unbroken stretches (gap > 3 samples = break)
+  const runs=[]; let s0=0;
+  for(let i=1;i<=t.length;i++){ if(i===t.length || t[i]-t[i-1]>3e6/fs){ runs.push([s0,i]); s0=i; } }
+  return runs;
+}
 function welch(t, g, fs){
+  // Welch PSD: 4096-sample pieces (~65 s, 0.015 Hz bins), 50 % overlap,
+  // each piece: remove a straight-line trend (drift, slow tilt) -> periodic Hann window -> FFT -> |X|²,
+  // then average the pieces. Output is ASD in µg/√Hz (one-sided), same scaling as scipy.signal.welch.
   const n=NSEG, step=n/2, w=new Float64Array(n); let ws=0;
-  for(let i=0;i<n;i++){ w[i]=0.5-0.5*Math.cos(2*Math.PI*i/(n-1)); ws+=w[i]*w[i]; }
+  for(let i=0;i<n;i++){ w[i]=0.5-0.5*Math.cos(2*Math.PI*i/n); ws+=w[i]*w[i]; }   // periodic Hann (scipy default)
+  const xm=(n-1)/2; let sxx=0; for(let i=0;i<n;i++) sxx+=(i-xm)*(i-xm);
   const acc=[new Float64Array(n/2+1),new Float64Array(n/2+1),new Float64Array(n/2+1)];
   const re=new Float64Array(n), im=new Float64Array(n); let pieces=0;
-  let s0=0;
-  const runs=[]; for(let i=1;i<=t.length;i++){ if(i===t.length || t[i]-t[i-1]>3e6/fs){ runs.push([s0,i]); s0=i; } }
-  for(const [a,b] of runs) for(let s=a;s+n<=b;s+=step){
+  for(const [a,b] of runsOf(t,fs)) for(let s=a;s+n<=b;s+=step){
     for(let ax=0;ax<3;ax++){
-      let m=0; for(let i=0;i<n;i++) m+=g[3*(s+i)+ax]; m/=n;
-      for(let i=0;i<n;i++){ re[i]=(g[3*(s+i)+ax]-m)*w[i]; im[i]=0; }
+      let m=0, sxy=0;
+      for(let i=0;i<n;i++) m+=g[3*(s+i)+ax]; m/=n;
+      for(let i=0;i<n;i++) sxy+=(i-xm)*(g[3*(s+i)+ax]-m);
+      const slope=sxy/sxx;                                   // linear detrend
+      for(let i=0;i<n;i++){ re[i]=(g[3*(s+i)+ax]-m-slope*(i-xm))*w[i]; im[i]=0; }
       fft(re,im); const A=acc[ax]; for(let f=0;f<=n/2;f++) A[f]+=re[f]*re[f]+im[f]*im[f];
     }
     pieces++;
   }
   if(!pieces) return null;
-  const scale=2/(fs*ws), f=[...Array(n/2+1)].map((_,i)=>i*fs/n);
-  return {f, asd: acc.map(A=>Array.from(A,v=>Math.sqrt(v/pieces*scale)*1e6)), pieces};
+  const f=[...Array(n/2+1)].map((_,i)=>i*fs/n);
+  const asd = acc.map(A=>Array.from(A,(v,i)=>{
+    const one = (i===0 || i===n/2) ? 1 : 2;                  // DC and Nyquist are not doubled
+    return Math.sqrt(v/pieces*one/(fs*ws))*1e6; }));
+  return {f, asd, pieces};
+}
+function findPeaks(f, a, maxN=5){
+  // Candidate modes: local maxima in BAND that stand at least 3x (ASD) above the local noise floor.
+  // Floor = running median over ±0.5 Hz, so a coloured floor (traffic, wind) is followed.
+  // Frequency is refined between bins by fitting a parabola to log(PSD) of the 3 top bins.
+  const df=f[1]-f[0], half=Math.max(3,Math.round(0.5/df));
+  const i0=Math.max(1,Math.ceil(BAND[0]/df)), i1=Math.min(f.length-2,Math.floor(BAND[1]/df));
+  const floor=new Float64Array(f.length);
+  for(let i=i0;i<=i1;i++){
+    const w=a.slice(Math.max(1,i-half), Math.min(f.length-1,i+half+1)).sort((x,y)=>x-y);
+    floor[i]=w[w.length>>1];
+  }
+  const cand=[];
+  for(let i=i0;i<=i1;i++){
+    if(a[i]>a[i-1] && a[i]>=a[i+1] && a[i]>=3*floor[i]){
+      const l=Math.log(a[i-1]**2), c=Math.log(a[i]**2), r=Math.log(a[i+1]**2), d=l-2*c+r;
+      const off = d<0 ? 0.5*(l-r)/d : 0;
+      cand.push({f:(i+off)*df, asd:a[i], snr:a[i]/floor[i]});
+    }
+  }
+  cand.sort((x,y)=>y.snr-x.snr);
+  const out=[];                                              // keep peaks at least 0.1 Hz apart
+  for(const c of cand){ if(out.every(o=>Math.abs(o.f-c.f)>=0.1)) out.push(c); if(out.length>=maxN) break; }
+  return out.sort((x,y)=>x.f-y.f);
+}
+function highpass(x, fs, fc){
+  // Zero-phase high-pass (2nd-order Butterworth run forward and backward = 4th order, no time shift).
+  // Ends are padded with an odd reflection so the start and end do not jump.
+  const n=x.length; if(n<8) return Float64Array.from(x, v=>v-x[0]);
+  const w0=2*Math.PI*fc/fs, al=Math.sin(w0)/(2*Math.SQRT1_2), c=Math.cos(w0), a0=1+al;
+  const b0=(1+c)/2/a0, b1=-(1+c)/a0, b2=b0, a1=-2*c/a0, a2=(1-al)/a0;
+  const pad=Math.min(n-1, Math.round(3*fs/fc));
+  const y=new Float64Array(n+2*pad);
+  for(let i=0;i<pad;i++) y[i]=2*x[0]-x[pad-i];
+  for(let i=0;i<n;i++) y[pad+i]=x[i];
+  for(let i=0;i<pad;i++) y[pad+n+i]=2*x[n-1]-x[n-2-i];
+  const pass=()=>{ let z1=0,z2=0; const x0=y[0];             // start from rest at the first value
+    for(let i=0;i<y.length;i++){ const v=y[i]-x0, o=b0*v+z1; z1=b1*v-a1*o+z2; z2=b2*v-a2*o; y[i]=o; } };
+  pass(); y.reverse(); pass(); y.reverse();
+  return y.subarray(pad, pad+n);
 }
 
 // ---------- drawing ----------
@@ -275,17 +331,22 @@ function draw(){
   const xr = [fmtTime(t0), fmtTime(t1)];
   for(let k=0;k<3;k++){
     let mean=0; for(let i=0;i<n;i++) mean+=g[3*i+k]; mean/=n;
-    let ss=0, mn=1e9, mx=-1e9; for(let i=0;i<n;i++){ const y=(g[3*i+k]-mean)*1000; ss+=y*y; if(y<mn)mn=y; if(y>mx)mx=y; }
-    const fixed = scaleMode==="fixed", u = fixed ? 1 : 1000, off = fixed ? 0 : mean;   // g with gravity, or mg around the mean
-    document.getElementById("ht"+k).textContent = (fixed ? `${AX[k]} acceleration (g, ±2 g scale)` : `${AX[k]} acceleration (mg, mean removed)`) + ` · mean ${mean>=0?"+":""}${mean.toFixed(4)} g · RMS ${Math.sqrt(ss/n).toFixed(3)} mg · peak-peak ${(mx-mn).toFixed(2)} mg`;
+    const fixed = scaleMode==="fixed";
+    // shown signal: raw g with gravity (±2 g), or mg after the zero-phase high-pass (Zoom), filtered per unbroken run
+    const sig = new Float64Array(n);
+    if(fixed){ for(let i=0;i<n;i++) sig[i]=g[3*i+k]; }
+    else for(const [a,b] of runsOf(t,fs)){ const x=new Float64Array(b-a); for(let i=a;i<b;i++) x[i-a]=g[3*i+k];
+      const yv=highpass(x,fs,HP_HZ); for(let i=a;i<b;i++) sig[i]=yv[i-a]*1000; }
+    let ss=0, mn=1e9, mx=-1e9; for(let i=0;i<n;i++){ const y=fixed?(sig[i]-mean)*1000:sig[i]; ss+=y*y; if(y<mn)mn=y; if(y>mx)mx=y; }
+    document.getElementById("ht"+k).textContent = (fixed ? `${AX[k]} acceleration (g, ±2 g scale)` : `${AX[k]} acceleration (mg, high-pass ${HP_HZ} Hz)`) + ` · mean ${mean>=0?"+":""}${mean.toFixed(4)} g · RMS ${Math.sqrt(ss/n).toFixed(3)} mg · peak-peak ${(mx-mn).toFixed(2)} mg`;
     let traces;
     if(n<=6000){
       const xs=[], ys=[];
-      for(let i=0;i<n;i++){ if(i && t[i]-t[i-1]>3e6/fs){ xs.push(null); ys.push(null); } xs.push(fmtTime(t[i])); ys.push((g[3*i+k]-off)*u); }
+      for(let i=0;i<n;i++){ if(i && t[i]-t[i-1]>3e6/fs){ xs.push(null); ys.push(null); } xs.push(fmtTime(t[i])); ys.push(sig[i]); }
       traces=[{x:xs,y:ys,type:"scatter",mode:"lines",line:{width:1,color:COL[k]},hoverinfo:"x+y"}];
     }else{
       const NB=900, lo=new Array(NB).fill(null), hi=new Array(NB).fill(null), sum=new Float64Array(NB), cnt=new Uint32Array(NB);
-      for(let i=0;i<n;i++){ const b=Math.min(NB-1,Math.floor((t[i]-t0)/(t1-t0)*NB)); const y=(g[3*i+k]-off)*u;
+      for(let i=0;i<n;i++){ const b=Math.min(NB-1,Math.floor((t[i]-t0)/(t1-t0)*NB)); const y=sig[i];
         if(lo[b]===null||y<lo[b]) lo[b]=y; if(hi[b]===null||y>hi[b]) hi[b]=y; sum[b]+=y; cnt[b]++; }
       const xs=[...Array(NB)].map((_,b)=>fmtTime(t0+(b+0.5)*(t1-t0)/NB)), av=[...cnt].map((c,b)=>c?sum[b]/c:null);
       const px=[], py=[]; let b=0;
@@ -308,17 +369,17 @@ function draw(){
   const sp = specCache.val;
   for(let k=0;k<3;k++){
     if(!sp){ document.getElementById("hf"+k).textContent=`${AX[k]} spectrum: needs 65 s of unbroken data`; Plotly.purge("pf"+k); continue; }
-    const f=sp.f, a=sp.asd[k]; let bi=0, bv=0; const band=[];
-    for(let i=0;i<f.length;i++) if(f[i]>0.4 && f[i]<25){ band.push(a[i]); if(a[i]>bv){bv=a[i];bi=i;} }
-    band.sort((x,y)=>x-y); const med=band[band.length>>1];
-    document.getElementById("hf"+k).textContent = `${AX[k]} spectrum (µg/√Hz) · ${sp.pieces} pieces · peak ${f[bi].toFixed(2)} Hz, ${(bv/med).toFixed(1)}× floor`;
+    const f=sp.f, a=sp.asd[k], pk=findPeaks(f,a);
+    document.getElementById("hf"+k).textContent = `${AX[k]} spectrum (µg/√Hz) · ${sp.pieces} pieces · ` +
+      (pk.length ? "peaks " + pk.map(p=>`${p.f.toFixed(2)} Hz (${p.snr.toFixed(0)}×)`).join(", ") : `no clear peak in ${BAND[0]}–${BAND[1]} Hz`);
     const x1=[], y1=[]; for(let i=1;i<f.length;i++){ x1.push(f[i]); y1.push(a[i]); }
     Plotly.react("pf"+k, [
       {x:x1,y:y1,type:"scatter",mode:"lines",line:{width:1,color:COL[k]},hovertemplate:"%{x:.2f} Hz<br>%{y:.1f} µg/√Hz<extra></extra>"},
       {x:[0,31.3],y:[22.5,22.5],type:"scatter",mode:"lines",line:{width:1,dash:"dash",color:MUTED},hoverinfo:"skip"},
-      {x:[f[bi]],y:[bv],type:"scatter",mode:"markers+text",marker:{size:7,color:COL[k]},text:[" "+f[bi].toFixed(2)+" Hz"],textposition:"middle right",hoverinfo:"skip"}
+      {x:pk.map(p=>p.f),y:pk.map(p=>p.asd),type:"scatter",mode:"markers+text",marker:{size:7,color:COL[k]},text:pk.map(p=>" "+p.f.toFixed(2)),textposition:"top center",hoverinfo:"skip"},
+      {x:[BAND[1],BAND[1]],y:[1,1e5],type:"scatter",mode:"lines",line:{width:1,dash:"dot",color:MUTED},hoverinfo:"skip"}
     ], Object.assign({}, base, {xaxis:{gridcolor:LINE,range:[0,31.3],title:{text:k===2?"frequency (Hz)":"",standoff:4}},
-       yaxis:{gridcolor:LINE,type:"log",nticks:5}}), cfg);
+       yaxis:{gridcolor:LINE,type:"log",nticks:5,range:[Math.log10(Math.max(1,Math.min(...y1)*0.7)),Math.log10(Math.max(...y1)*2)]}}), cfg);
   }
 }
 
