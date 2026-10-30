@@ -67,7 +67,7 @@ h1{font-size:19px;margin:0}
   </div>
   <div class="ranges" id="savegrp" role="group" aria-label="Save data">
     <input id="tag" class="tag" type="text" autocomplete="off" spellcheck="false" placeholder="file name, e.g. step5_f5_v0.1" aria-label="File name">
-    <button type="button" id="saveBtn" title="Save the samples shown (Start→Stop window, or the time range) as CSV">Save CSV</button>
+    <button type="button" id="saveBtn" title="Save the samples shown (Start→Stop window, or the time range) as CSV">Save CSV</button><button type="button" id="mseedBtn" title="Resample the samples shown onto an even 62.5 Hz UTC grid and save as MiniSEED (ObsPy, pyOMA)">Save MiniSEED</button>
   </div>
   <span class="live" id="live" aria-live="polite">connecting…</span>
 </header>
@@ -79,6 +79,7 @@ h1{font-size:19px;margin:0}
   Spectrum: Welch average over the whole range (65 s pieces = 0.015 Hz resolution, linear detrend, Hann window, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz; "Spectrum linear" shows peaks the way single-FFT plots do (tall peaks, floor flattened near zero); "Spectrum log" keeps weak modes and the noise floor visible; dotted line = 15 Hz, top of the mode search band (the chip's own filter cuts off near 15.6 Hz). Labels = up to 5 peaks in 0.3–15 Hz at least 3× above the local floor, refined between bins. A peak is a candidate mode: check it shows on every node and stays put across recordings.
   Start / Stop: Start analyses only data from that moment (older data stays stored, just ignored); Stop freezes the window so you can read the result; Auto-stop stops by itself after the chosen time; All data goes back to the normal time range. While a window is set, the range buttons are ignored. The first 65 s use 16 s spectrum pieces (0.06 Hz), then 65 s pieces (0.015 Hz). The window is kept per node across reloads.
   Save CSV: saves exactly the samples in view (the Start→Stop window, or the selected time range) in the same layout as the step 3/5 lab files (raw LSB x,y,z with #T timing lines), so step3_noise.py and step5_shaker.py read it unchanged. Type a name such as step5_f5_v0.1 so step5_shaker.py knows the frequency and Vpp; empty = node + time.
+  Save MiniSEED: the same samples resampled onto an even UTC grid (exactly 62.5 Hz on multiples of 16 ms, so every node lines up), in g, channels XD.S01..BN1/BN2/BNZ = X/Y/Z, 4096-byte float32 records. Sample times are cleaned first (the chip samples evenly; the stamps carry about ±1 ms of NTP wander); gaps are not bridged, each unbroken stretch becomes its own piece. Read with obspy.read("file.mseed").
   LIVE: while this page is open it asks the node to also send its newest samples every 0.25 s (about 0.5–1 s behind); the 10-second blocks fill in the history.
   Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
 </div>
@@ -533,6 +534,96 @@ function saveCsv(){
   setStatus(`saved ${name} · ${n.toLocaleString()} samples · ${Math.floor(sec/60)}:${String(sec%60).padStart(2,"0")} · ${gaps} gap${gaps===1?"":"s"}` + (gaps ? " (marked #GAP in the file; step5_shaker.py assumes no gaps, so its frequency and amplitude will be off: pick a window without gaps)" : ""));
 }
 document.getElementById("saveBtn").addEventListener("click", saveCsv);
+
+// ---------- Save MiniSEED: resample onto an even UTC grid, then write MiniSEED v2 ----------
+// 1) split at gaps; 2) clean the sample times: the ADXL355 samples evenly, the stamps carry
+//    ISR jitter and NTP wander (about ±1 ms), so time = straight-line fit + a 20-min moving
+//    average of what is left (follows slow temperature drift, removes the faster NTP wander);
+// 3) grid = exactly 62.5 Hz on multiples of 16 ms UTC, the same rule on every node;
+// 4) cubic (Keys) interpolation onto the grid, never across a gap;
+// 5) MiniSEED v2, 4096-byte records, float32 big-endian, channels BN1/BN2/BNZ (X/Y/Z, in g).
+const GRID_FS = 62.5, GRID_DT = 1e6 / GRID_FS;   // 16,000 µs
+function cleanTimes(t, a, b){                    // returns cleaned µs for samples a..b-1, plus fit stats
+  const n = b - a, t0 = t[a];
+  let sx=0, sy=0, sxx=0, sxy=0;
+  for(let i=0;i<n;i++){ const y=t[a+i]-t0; sx+=i; sy+=y; sxx+=i*i; sxy+=i*y; }
+  const slope = (n*sxy - sx*sy) / (n*sxx - sx*sx), icpt = (sy - slope*sx) / n;
+  const r = new Float64Array(n); for(let i=0;i<n;i++) r[i] = (t[a+i]-t0) - (icpt + slope*i);
+  const half = Math.round(10*60e6/slope);                         // ±10 min of samples
+  const cs = new Float64Array(n+1); for(let i=0;i<n;i++) cs[i+1] = cs[i] + r[i];
+  const tc = new Float64Array(n); let ss = 0;
+  for(let i=0;i<n;i++){
+    const lo=Math.max(0,i-half), hi=Math.min(n,i+half+1), sm=(cs[hi]-cs[lo])/(hi-lo);
+    tc[i] = t0 + icpt + slope*i + sm; ss += (r[i]-sm)**2;
+  }
+  return {tc, period: slope, jitter: Math.sqrt(ss/n)};
+}
+function keys(p0,p1,p2,p3,u){                    // cubic convolution (a = -0.5), u in [0,1)
+  return p1 + 0.5*u*(p2-p0 + u*(2*p0-5*p1+4*p2-p3 + u*(3*(p1-p2)+p3-p0)));
+}
+function resampleRun(tc, g, a, axis){             // returns {start (µs UTC), data Float32Array}
+  const n = tc.length; if(n < 4) return null;
+  const T0 = Math.ceil(tc[0]/GRID_DT)*GRID_DT, m = Math.floor((tc[n-1]-T0)/GRID_DT) + 1;
+  if(m < 1) return null;
+  const out = new Float32Array(m), v = i => g[3*(a+Math.max(0,Math.min(n-1,i)))+axis];
+  let i = 0;
+  for(let k=0;k<m;k++){
+    const T = T0 + k*GRID_DT;
+    while(i < n-2 && tc[i+1] <= T) i++;
+    const u = (T - tc[i]) / (tc[i+1] - tc[i]);
+    out[k] = keys(v(i-1), v(i), v(i+1), v(i+2), u);
+  }
+  return {start: T0, data: out};
+}
+function btime(dv, o, us){                        // SEED BTIME, 0.1 ms resolution
+  const d = new Date(Math.floor(us/1000)), y = d.getUTCFullYear();
+  const doy = Math.floor((Date.UTC(y, d.getUTCMonth(), d.getUTCDate()) - Date.UTC(y,0,1))/864e5) + 1;
+  dv.setUint16(o, y); dv.setUint16(o+2, doy); dv.setUint8(o+4, d.getUTCHours()); dv.setUint8(o+5, d.getUTCMinutes());
+  dv.setUint8(o+6, d.getUTCSeconds()); dv.setUint8(o+7, 0); dv.setUint16(o+8, Math.round((us % 1e6)/100) % 10000);
+}
+function mseedRecords(sta, cha, start, data, seq){  // -> array of 4096-byte records
+  const REC = 4096, PER = (REC-64)/4, recs = [], ascii = (dv,o,s,len) => { for(let j=0;j<len;j++) dv.setUint8(o+j, (s[j]||" ").charCodeAt(0)); };
+  for(let p=0;p<data.length;p+=PER){
+    const ns = Math.min(PER, data.length-p), buf = new ArrayBuffer(REC), dv = new DataView(buf);
+    ascii(dv,0,String(seq.n++ % 1000000).padStart(6,"0"),6); ascii(dv,6,"D",1); ascii(dv,7," ",1);
+    ascii(dv,8,sta,5); ascii(dv,13,"",2); ascii(dv,15,cha,3); ascii(dv,18,"XD",2);
+    btime(dv, 20, start + p*GRID_DT);
+    dv.setUint16(30, ns); dv.setInt16(32, 625); dv.setInt16(34, -10);          // 625 / 10 = 62.5 Hz
+    dv.setUint8(39, 1); dv.setInt32(40, 0); dv.setUint16(44, 64); dv.setUint16(46, 48);
+    dv.setUint16(48, 1000); dv.setUint16(50, 0); dv.setUint8(52, 4); dv.setUint8(53, 1); dv.setUint8(54, 12);   // float32, big-endian, 2^12
+    for(let j=0;j<ns;j++) dv.setFloat32(64+4*j, data[p+j]);
+    recs.push(buf);
+  }
+  return recs;
+}
+function saveMseed(){
+  const d = gather(RANGES[rangeI][1]);
+  if(!d || d.t.length < 100){ setStatus("nothing to save yet: no samples in this window"); return; }
+  const {t, g} = d;
+  let dsum=0, dn=0; for(let i=1;i<t.length;i++){ const x=t[i]-t[i-1]; if(x>0 && x<48000){ dsum+=x; dn++; } }
+  const fs = dn ? 1e6/(dsum/dn) : 62.5, sta = NODE.split("/").pop().slice(0,5), seq = {n:1};
+  const parts = [[], [], []]; let runs = 0, jit = 0, per = 0, nOut = 0, first = null, last = null;
+  for(const [a,b] of runsOf(t, fs)){
+    if(b - a < 64) continue;                                     // skip scraps shorter than ~1 s
+    const c = cleanTimes(t, a, b); runs++; jit = Math.max(jit, c.jitter); per = c.period;
+    ["BN1","BN2","BNZ"].forEach((cha, ax) => {
+      const r = resampleRun(c.tc, g, a, ax); if(!r) return;
+      parts[ax].push(...mseedRecords(sta, cha, r.start, r.data, seq));
+      if(ax === 2){ nOut += r.data.length; if(first===null) first = r.start; last = r.start + (r.data.length-1)*GRID_DT; }
+    });
+  }
+  if(!nOut){ setStatus("nothing to save: no unbroken stretch longer than 1 s"); return; }
+  const tag = document.getElementById("tag").value.trim().replace(/\.(csv|mseed)$/i, "").replace(/[^A-Za-z0-9_.-]+/g, "_");
+  const stamp = fmtTime(t[0]).replace(/[-:]/g, "").replace(" ", "_") + "-" + fmtTime(t[t.length-1]).slice(11).replace(/:/g, "");
+  const name = NODE.replace(/\//g, "_") + "_" + (tag || stamp) + ".mseed";
+  const url = URL.createObjectURL(new Blob([...parts[0], ...parts[1], ...parts[2]], {type:"application/vnd.fdsn.mseed"}));
+  const el = document.createElement("a"); el.href = url; el.download = name; document.body.appendChild(el); el.click(); el.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 10000);
+  const iso = us => new Date(us/1000).toISOString().replace("T"," ").slice(0,23) + " UTC";
+  setStatus(`saved ${name} · ${iso(first)} → ${iso(last)} · ${nOut.toLocaleString()} samples at 62.5 Hz (from ${(1e6/per).toFixed(3)} Hz) · ${runs} piece${runs===1?"":"s"}` +
+            ` · leftover timestamp wander ${(jit/1000).toFixed(2)} ms rms (NTP; GPS in step 12 brings this to µs)`);
+}
+document.getElementById("mseedBtn").addEventListener("click", saveMseed);
 refresh(); setInterval(refresh, 10000);
 </script>
 </body>
