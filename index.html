@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Project XD Live</title>
 <script src="https://cdn.jsdelivr.net/npm/plotly.js-basic-dist-min@2.35.2/plotly-basic.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <style>
 /* Field-instrument dashboard: controls bar, three axis rows (signal | spectrum). */
 :root{
@@ -25,6 +26,10 @@ h1{font-size:19px;margin:0}
 .ranges button.on{background:var(--accent);border-color:var(--accent);color:var(--surface);font-weight:600}
 .ranges button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .status{font:12px var(--mono);color:var(--muted);padding:0 16px 8px}
+.live{font:600 12.5px var(--f);padding:3px 10px;border-radius:999px;background:var(--line);color:var(--muted)}
+.live.on{background:#C62828;color:#fff}
+.live.on::before{content:"● "}
+.live.wait{background:var(--line);color:var(--ink)}
 .stats{display:flex;flex-wrap:wrap;gap:6px 22px;padding:0 16px 10px;font-size:13px;color:var(--muted)}
 .stats b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
 .grid{display:grid;grid-template-columns:1.6fr 1fr;gap:10px;padding:0 12px 16px}
@@ -39,6 +44,7 @@ h1{font-size:19px;margin:0}
 <header>
   <h1>Project XD Live · <span id="node">S01</span></h1>
   <div class="ranges" id="ranges" role="group" aria-label="Time range"></div>
+  <span class="live" id="live" aria-live="polite">connecting…</span>
 </header>
 <div class="status" id="status">starting…</div>
 <div class="stats" id="stats"></div>
@@ -46,6 +52,7 @@ h1{font-size:19px;margin:0}
 <div class="foot">
   Signal: mean removed; long ranges show the min–max band of each pixel plus the mean line, so short shocks stay visible.
   Spectrum: Welch average over the whole range (65 s pieces, Hann, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz.
+  LIVE: while this page is open it asks the node to also stream every second (about 1–2 s behind); the 10-second blocks fill in the history.
   Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
 </div>
 
@@ -63,6 +70,7 @@ document.getElementById("node").textContent = NODE;
 let rangeI = (()=>{ try { return +localStorage.getItem("xd-range") || 0; } catch(e){ return 0; } })();
 const blocks = new Map();                // key -> {utc: Float64Array (µs), g: Float32Array(n*3)}
 let approx = false, busy = false;
+const live = {t:[], g:[], last:0};      // live samples (µs, [x,y,z] g) newer than the stored blocks
 const setStatus = s => document.getElementById("status").textContent = s;
 
 // ---------- cache in IndexedDB (one copy of every block per browser) ----------
@@ -143,9 +151,53 @@ async function refresh(){
   busy = false;
 }
 
+// ---------- live feed (Supabase Realtime) ----------
+const liveEl = document.getElementById("live");
+function onLive(p){
+  if(!p || !p.d || !p.u0) return;                        // u0 = 0 means the node has no internet time yet
+  for(let i=0;i<p.d.length;i++){
+    const t = p.u0 + p.d[i];
+    if(t <= live.last) continue;
+    live.t.push(t); live.g.push([p.x[i]/256000/CAL[0], p.y[i]/256000/CAL[1], p.z[i]/256000/CAL[2]]);
+    live.last = t;
+  }
+  const cut = live.last - 15*60e6;                       // keep 15 min
+  let k=0; while(k<live.t.length && live.t[k]<cut) k++;
+  if(k){ live.t.splice(0,k); live.g.splice(0,k); }
+  liveDirty = true;
+}
+let liveDirty = false;
+try{
+  const sb = supabase.createClient(URL_.replace("/storage/v1",""), KEY);
+  sb.channel("xd-live-"+NODE).on("broadcast",{event:"samples"},m=>onLive(m.payload))
+    .subscribe(st=>{ if(st==="SUBSCRIBED") liveEl.textContent="waiting for node…"; });
+}catch(e){ liveEl.textContent = "live off ("+e.message+")"; }
+async function heartbeat(){                               // tell the node someone is watching (for the next 90 s)
+  try{
+    await fetch(URL_+"/object/"+BUCKET+"/_live/"+NODE+".json",{method:"POST",
+      headers:Object.assign({"Content-Type":"application/json","x-upsert":"true"},H),
+      body:JSON.stringify({until:Math.floor(Date.now()/1000)+90})});
+  }catch(e){}
+}
+heartbeat(); setInterval(heartbeat, 30000);
+setInterval(()=>{
+  const age = live.last ? (Date.now()*1000 - live.last)/1e6 : Infinity;
+  if(age < 6){ liveEl.className="live on"; liveEl.textContent="LIVE · "+age.toFixed(1)+" s behind"; }
+  else if(live.last){ liveEl.className="live wait"; liveEl.textContent="live paused ("+Math.round(age)+" s)"; }
+  else { liveEl.className="live wait"; liveEl.textContent="waiting for node (up to 20 s)…"; }
+  if(liveDirty && RANGES[rangeI][1] <= 3600){ liveDirty=false; draw(); }   // short ranges redraw every second
+}, 1000);
+
 // ---------- analysis ----------
 function gather(W){
   const parts = [...blocks.values()].filter(b=>b.utc.length);
+  let tb = 0; for(const b of parts) tb = Math.max(tb, b.utc[b.utc.length-1]);
+  let li = 0; while(li<live.t.length && live.t[li] <= tb + 5000) li++;          // live samples after the newest block
+  if(li < live.t.length){
+    const n = live.t.length-li, ut = new Float64Array(n), ug = new Float32Array(n*3);
+    for(let i=0;i<n;i++){ ut[i]=live.t[li+i]; ug[3*i]=live.g[li+i][0]; ug[3*i+1]=live.g[li+i][1]; ug[3*i+2]=live.g[li+i][2]; }
+    parts.push({utc:ut, g:ug});
+  }
   if(!parts.length) return null;
   let t1 = 0; for(const b of parts) t1 = Math.max(t1, b.utc[b.utc.length-1]);
   const t0 = t1 - W*1e6;
