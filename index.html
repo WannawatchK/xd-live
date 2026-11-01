@@ -30,6 +30,10 @@ h1{font-size:19px;margin:0}
 .auto select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:4px 8px;margin-left:4px}
 .auto select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .ranges button:disabled{opacity:.45;cursor:default}
+.nodes{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12.5px;color:var(--muted)}
+.nodes a{color:var(--ink);text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:3px 10px}
+.nodes a.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.nodes a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .tag{font:inherit;font-size:13px;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:5px 11px;width:15.5em;max-width:60vw}
 .tag:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .since{font-size:12.5px;color:var(--muted);align-self:center;font-variant-numeric:tabular-nums}
@@ -65,6 +69,12 @@ h1{font-size:19px;margin:0}
     </select></label>
     <span class="since" id="since" aria-live="polite"></span>
   </div>
+  <div class="ranges" id="nodegrp" role="group" aria-label="Switch node">
+    <input id="nodeIn" class="tag" style="width:7em" list="nodeList" autocomplete="off" spellcheck="false" aria-label="Node" placeholder="node, e.g. S02">
+    <datalist id="nodeList"></datalist>
+    <button type="button" id="nodeBtn" title="Open this page for another node">Open node</button>
+  </div>
+  <div class="nodes" id="nodesbar" aria-live="polite"></div>
   <div class="ranges" id="savegrp" role="group" aria-label="Save data">
     <input id="tag" class="tag" type="text" autocomplete="off" spellcheck="false" placeholder="file name, e.g. step5_f5_v0.1" aria-label="File name">
     <button type="button" id="saveBtn" title="Save the samples shown (Start→Stop window, or the time range) as CSV">Save CSV</button><button type="button" id="mseedBtn" title="Resample the samples shown onto an even 62.5 Hz UTC grid and save as MiniSEED (ObsPy, pyOMA)">Save MiniSEED</button>
@@ -79,6 +89,7 @@ h1{font-size:19px;margin:0}
   Spectrum: Welch average over the whole range (65 s pieces = 0.015 Hz resolution, linear detrend, Hann window, half overlap) in µg/√Hz; dashed line = ADXL355 datasheet noise 22.5 µg/√Hz; "Spectrum linear" shows peaks the way single-FFT plots do (tall peaks, floor flattened near zero); "Spectrum log" keeps weak modes and the noise floor visible; dotted line = 15 Hz, top of the mode search band (the chip's own filter cuts off near 15.6 Hz). Labels = up to 5 peaks in 0.3–15 Hz at least 3× above the local floor, refined between bins. A peak is a candidate mode: check it shows on every node and stays put across recordings.
   Start / Stop: Start analyses only data from that moment (older data stays stored, just ignored); Stop freezes the window so you can read the result; Auto-stop stops by itself after the chosen time; All data goes back to the normal time range. While a window is set, the range buttons are ignored. The first 65 s use 16 s spectrum pieces (0.06 Hz), then 65 s pieces (0.015 Hz). The window is kept per node across reloads.
   Save CSV: saves exactly the samples in view (the Start→Stop window, or the selected time range) in the same layout as the step 3/5 lab files (raw LSB x,y,z with #T timing lines), so step3_noise.py and step5_shaker.py read it unchanged. Type a name such as step5_f5_v0.1 so step5_shaker.py knows the frequency and Vpp; empty = node + time.
+  Tilt: angle of the box from vertical, from the gravity direction over the last 10 s; use it while adjusting the leveling feet (a few degrees is fine: xd_align.py rotates the axes exactly afterwards).
   Save MiniSEED: the same samples resampled onto an even UTC grid (exactly 62.5 Hz on multiples of 16 ms, so every node lines up), in g, channels XD.S01..BN1/BN2/BNZ = X/Y/Z, 4096-byte float32 records. Sample times are cleaned first (the chip samples evenly; the stamps carry about ±1 ms of NTP wander); gaps are not bridged, each unbroken stretch becomes its own piece. Read with obspy.read("file.mseed").
   LIVE: while this page is open it asks the node to also send its newest samples every 0.25 s (about 0.5–1 s behind); the 10-second blocks fill in the history.
   Blocks are kept in this browser after the first download (one day of one node ≈ 86 MB). Times are Thailand time.
@@ -89,7 +100,17 @@ const URL_ = "https://nwpuskqpyzlbjosqfwns.supabase.co/storage/v1";
 const KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im53cHVza3FweXpsYmpvc3Fmd25zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMzNTM2ODcsImV4cCI6MjEwODkyOTY4N30.OVTio5RxzG6ByhSgCkMkJMd7ewPqrC4VVl61LwUNkZI";
 const BUCKET = "xd-raw";
 const NODE = new URLSearchParams(location.search).get("node") || "S01";
-const CAL = [0.98903, 0.99305, 1.01354];
+// Step 2 sensitivity per sensor (X, Y, Z). Firmware v3.1 boards publish their own values
+// (typed on the board's setup page) to xd-raw/_nodes/<node>.json, which wins over this table;
+// this table is only the fallback for boards on older firmware.
+const CAL_TABLE = {
+  S01: [0.98903, 0.99305, 1.01354],
+  // S02: [x, y, z],
+};
+const NODE_BASE = NODE.split("/").pop();
+let CAL = CAL_TABLE[NODE_BASE] || [1, 1, 1];
+let CAL_OK = !!CAL_TABLE[NODE_BASE];
+let NODE_INFO = null;          // {node, cal, fw, session, ...} from the board itself (firmware v3.1+)
 const H = {Authorization: "Bearer " + KEY, apikey: KEY};
 const RANGES = [["10 min",600],["30 min",1800],["1 hour",3600],["4 hours",14400],["6 hours",21600],["12 hours",43200],["1 day",86400]];
 const NSEG = 4096;                       // Welch piece, about 65 s at 62.7 Hz
@@ -382,7 +403,11 @@ function draw(){
     `<span>range <b>${rec.start ? (recRunning() ? "Start → now" : "Start → Stop") : name}</b></span><span>samples <b>${n.toLocaleString()}</b></span>`+
     `<span>coverage <b>${Math.min(100,Math.round(n/((t1-t0)/1e6*fs)*100))} %</b></span><span>fs <b>${fs.toFixed(3)} Hz</b></span>`+
     `<span>newest sample <b>${fmtTime(t1)}</b></span>`+
-    `<span>|a| = √(x²+y²+z²) <b>${(()=>{let s=0; const m=Math.min(n,630); for(let i=n-m;i<n;i++) s+=Math.hypot(g[3*i],g[3*i+1],g[3*i+2]); return (s/m).toFixed(4);})()} g</b> (last 10 s)</span>`+(approx?`<span>older v2 blocks timed by upload (± a few s)</span>`:"");
+    `<span>|a| = √(x²+y²+z²) <b>${(()=>{let s=0; const m=Math.min(n,630); for(let i=n-m;i<n;i++) s+=Math.hypot(g[3*i],g[3*i+1],g[3*i+2]); return (s/m).toFixed(4);})()} g</b> (last 10 s)</span>`+
+    `<span>tilt <b>${(()=>{ // from the gravity direction over the last 10 s: roll about X, pitch about Y, total off vertical
+      let x=0,y=0,z=0; const m=Math.min(n,630); for(let i=n-m;i<n;i++){ x+=g[3*i]; y+=g[3*i+1]; z+=g[3*i+2]; }
+      const d=180/Math.PI, roll=Math.atan2(y,z)*d, pitch=Math.atan2(-x,Math.hypot(y,z))*d, tot=Math.acos(z/Math.hypot(x,y,z))*d;
+      return `${tot.toFixed(2)}°</b> off vertical (roll ${roll>=0?"+":""}${roll.toFixed(2)}°, pitch ${pitch>=0?"+":""}${pitch.toFixed(2)}°)`; })()}</span>`+(approx?`<span>older v2 blocks timed by upload (± a few s)</span>`:"")+(CAL_OK?"":`<span>⚠ no step 2 calibration for ${NODE_BASE}: amplitudes uncorrected (±1–2 %)</span>`);
   const xr = [fmtTime(t0), fmtTime(t1)];
   for(let k=0;k<3;k++){
     let mean=0; for(let i=0;i<n;i++) mean+=g[3*i+k]; mean/=n;
@@ -535,6 +560,42 @@ function saveCsv(){
 }
 document.getElementById("saveBtn").addEventListener("click", saveCsv);
 
+// ---------- switch node: same page, ?node=<id> (each node keeps its own Start/Stop window) ----------
+// every node that has uploaded: boards on firmware v3.1+ announce themselves in _nodes/,
+// older ones are found from their data folders. Unnamed boards show as tests/NEW-xxxx.
+async function findNodes(){
+  const found = new Map();                       // key -> last seen (ms) or 0
+  const add = (k, t) => { if(k && !(found.get(k) >= t)) found.set(k, t || 0); };
+  const jsonKey = n => n.replace(/\.json$/, "");
+  try { for(const it of await list("_nodes/")) if(it.id && it.name.endsWith(".json")) add(jsonKey(it.name), Date.parse(it.updated_at || it.created_at || 0)); } catch(e) {}
+  try { for(const it of await list("_nodes/tests/")) if(it.id && it.name.endsWith(".json")) add("tests/" + jsonKey(it.name), Date.parse(it.updated_at || it.created_at || 0)); } catch(e) {}
+  try { for(const it of await list("")) if(!it.id && !/^(_live|_nodes|tests)$/.test(it.name)) add(it.name, 0); } catch(e) {}
+  try { for(const it of await list("tests/")) if(!it.id) add("tests/" + it.name, 0); } catch(e) {}
+  return [...found.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+(async () => {
+  const nodes = await findNodes();
+  if(!new URLSearchParams(location.search).get("node") && nodes.length && nodes[0][1] > 0 && nodes[0][0] !== NODE){
+    location.replace("?node=" + encodeURIComponent(nodes[0][0]).replace(/%2F/g, "/")); return;   // no node in the link: open the newest one
+  }
+  const bar = document.getElementById("nodesbar"), dl = document.getElementById("nodeList");
+  if(!nodes.length){ bar.textContent = ""; return; }
+  bar.append("Nodes: ");
+  for(const [k] of nodes){
+    const a = document.createElement("a"); a.textContent = k; a.href = "?node=" + encodeURIComponent(k).replace(/%2F/g, "/");
+    if(k === NODE){ a.className = "on"; a.setAttribute("aria-current", "page"); }
+    bar.append(a);
+    const o = document.createElement("option"); o.value = k; dl.appendChild(o);
+  }
+})();
+(() => {
+  const inp = document.getElementById("nodeIn"), dl = document.getElementById("nodeList");
+  inp.value = NODE;
+  const go = () => { const v = inp.value.trim().replace(/[^A-Za-z0-9_\/-]/g, ""); if(v && v !== NODE) location.search = "?node=" + encodeURIComponent(v).replace(/%2F/g, "/"); };
+  document.getElementById("nodeBtn").addEventListener("click", go);
+  inp.addEventListener("keydown", e => { if(e.key === "Enter") go(); });
+})();
+
 // ---------- Save MiniSEED: resample onto an even UTC grid, then write MiniSEED v2 ----------
 // 1) split at gaps; 2) clean the sample times: the ADXL355 samples evenly, the stamps carry
 //    ISR jitter and NTP wander (about ±1 ms), so time = straight-line fit + a 20-min moving
@@ -624,7 +685,21 @@ function saveMseed(){
             ` · leftover timestamp wander ${(jit/1000).toFixed(2)} ms rms (NTP; GPS in step 12 brings this to µs)`);
 }
 document.getElementById("mseedBtn").addEventListener("click", saveMseed);
-refresh(); setInterval(refresh, 10000);
+// read the board's own info (name, calibration, firmware) before the first load, so blocks are scaled right
+(async () => {
+  try {
+    const r = await fetch(URL_ + "/object/" + BUCKET + "/_nodes/" + NODE + ".json", {headers:H, cache:"no-store"});
+    if (r.ok) {
+      NODE_INFO = await r.json();
+      const c = NODE_INFO.cal;
+      if (Array.isArray(c) && c.length === 3 && c.every(v => v > 0.8 && v < 1.2)) {
+        CAL = c; CAL_OK = !c.every(v => v === 1) || !!CAL_TABLE[NODE_BASE];
+        if (c.every(v => v === 1) && CAL_TABLE[NODE_BASE]) { CAL = CAL_TABLE[NODE_BASE]; }
+      }
+    }
+  } catch(e) {}
+  refresh(); setInterval(refresh, 10000);
+})();
 </script>
 </body>
 </html>
